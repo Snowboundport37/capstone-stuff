@@ -1,6 +1,6 @@
 # Proxmox malware remediation lab
 
-![banner](docs/images/banner.png)
+![banner](docs/images/banner.gif)
 
 I am Andrei Gorlitsky. This is the public writeup of my Champlain College senior capstone: an isolated Proxmox lab that deploys Windows and Linux guests from golden images, detonates malware on a dead-end VLAN, scores Windows guests with a PowerShell behavioral detector through the QEMU guest agent, and then either cleans a known family in-guest or destroys the VM and clones the matching template back onto the same VMID.
 
@@ -60,7 +60,7 @@ If you opened the class wiki page [Complete Tools Documentation](https://github.
 
 ## Architecture
 
-![architecture](docs/images/architecture.png)
+![architecture](docs/images/architecture.gif)
 
 ```mermaid
 flowchart TD

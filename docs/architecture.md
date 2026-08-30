@@ -6,7 +6,7 @@ I am one of the authors. Deployment, inventories, and a chunk of the network VMs
 
 For the original proposal (Splunk-flavored SIEM language, Dell model number, FOG imaging, sub-48-hour MTTR), see [proposal.md](proposal.md). For what shipped, stay here.
 
-![architecture](images/architecture.png)
+![architecture](images/architecture.gif)
 
 ```mermaid
 flowchart TD
