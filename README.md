@@ -4,11 +4,23 @@
 
 I am Andrei Gorlitsky. This is the public writeup of my Champlain College senior capstone: an isolated Proxmox lab that deploys Windows and Linux guests from golden images, detonates malware on a dead-end VLAN, scores Windows guests with a PowerShell behavioral detector through the QEMU guest agent, and then either cleans a known family in-guest or destroys the VM and clones the matching template back onto the same VMID.
 
-It is a **team project**. Git history on the private class repo includes [Snowboundport37](https://github.com/Snowboundport37) (me), [seraphim](https://github.com/seraphim), [seraphimgerber](https://github.com/seraphimgerber), and [ConnorEast](https://github.com/ConnorEast). I wrote a lot of the detection and remediation loop. I did not write every playbook. Ask me in person which files are mine.
+It is a **team project**. Git history on the private class repo includes [Snowboundport37](https://github.com/Snowboundport37) (me), seraphim, seraphimgerber, and ConnorEast. I wrote a lot of the detection and remediation loop. I did not write every playbook. Ask me in person which files are mine.
 
 This repository is documentation. It is not a clone-and-run lab. The private source stays in the class org until credentials are stripped from git history.
 
 **Wiki (start here if you want the long form with a sidebar):** [github.com/Snowboundport37/capstone-stuff/wiki](https://github.com/Snowboundport37/capstone-stuff/wiki)
+
+
+## Demo videos
+
+Public team recordings, on [Connor East's playlist](https://www.youtube.com/playlist?list=PLPkOvo_i1rSDxZFL3YeICP31tdbLC-tmu):
+
+- [Deploy student VMs script](https://www.youtube.com/watch?v=VHfKWpawOFY) (9:20)
+- [Student VM removal script](https://www.youtube.com/watch?v=MjnJpV9ePZ0) (5:41)
+- [Video evidence of usability](https://www.youtube.com/watch?v=q4kTlXVMoHI) (13:36)
+
+Those are the public ones. A fourth clip on the same playlist is private (school login). I am not embedding it.
+
 
 ---
 
