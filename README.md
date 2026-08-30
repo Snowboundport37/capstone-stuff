@@ -19,7 +19,9 @@ Public team recordings, on [Connor East's playlist](https://www.youtube.com/play
 - [Student VM removal script](https://www.youtube.com/watch?v=MjnJpV9ePZ0) (5:41)
 - [Video evidence of usability](https://www.youtube.com/watch?v=q4kTlXVMoHI) (13:36)
 
-Those are the public ones. A fourth clip on the same playlist is private (school login). I am not embedding it.
+The fourth clip was school-login only on YouTube. The 1080p copy is in this repo:
+
+**[capstone demo, 1080p](docs/videos/capstone-demo-1080p.mp4)** (10:58, 1920x1080)
 
 
 ---
