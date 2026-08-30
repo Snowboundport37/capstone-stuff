@@ -323,6 +323,7 @@ I was one of the two people who committed the most. That is not the same as "I b
 
 ## Docs in this repo
 
+- [Homelab (how the rack is built)](docs/homelab.md)
 - [Architecture](docs/architecture.md)
 - [How detection scores and when a VM is rebuilt](docs/detection.md)
 - [Playbook catalog](docs/playbooks.md)

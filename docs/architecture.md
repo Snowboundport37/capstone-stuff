@@ -2,7 +2,7 @@
 
 This is the system that exists in the private tree, written so a stranger can follow it without lab passwords, teammate hostnames, or the live IP plan.
 
-I am one of the authors. Deployment, inventories, and a chunk of the network VMs are team work ([Snowboundport37](https://github.com/Snowboundport37), [seraphim](https://github.com/seraphim), [seraphimgerber](https://github.com/seraphimgerber), [ConnorEast](https://github.com/ConnorEast)). I can walk the detection and rebuild path without notes. I will not claim every YAML file.
+I am one of the authors. Deployment, inventories, and a chunk of the network VMs are team work ([Snowboundport37](https://github.com/Snowboundport37), seraphim, seraphimgerber, ConnorEast). I can walk the detection and rebuild path without notes. I will not claim every YAML file.
 
 For the original proposal (Splunk-flavored SIEM language, Dell model number, FOG imaging, sub-48-hour MTTR), see [proposal.md](proposal.md). For what shipped, stay here.
 
@@ -93,3 +93,5 @@ Reports land on the remediator under a timestamped JSON filename. `remediation-r
 ## What I would change
 
 Vault for secrets from day one. A public sanitized example inventory, not the live one. Sigma/YARA next to the PowerShell detector so the logic survives off this hypervisor. One deployment playbook instead of four generations. A diagram that includes failure cases (QGA down, clone fails, hash mismatch) instead of only the happy path.
+
+The physical rack and how we stood it up: [homelab.md](homelab.md).
