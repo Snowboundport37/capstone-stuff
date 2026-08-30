@@ -1,0 +1,281 @@
+# Malware Detection + Remediation Guide (Detailed, Easy Read)
+
+This guide explains exactly how your remediation pipeline works, what each script does, and what changed to make detection more reliable for WannaCry, LokiBot, and Kovter.
+
+---
+
+## 1) What this pipeline is designed to do
+
+The pipeline has one job:
+
+1. Scan target Windows VMs for malware evidence.
+2. Decide if infection is confirmed.
+3. If enabled, roll infected VMs back to a known-clean snapshot.
+4. Produce a report that explains the decision.
+
+It is designed for lab/range usage where snapshots are expected and rollback is the remediation action.
+
+---
+
+## 2) The 4 main files and their roles
+
+### `scan.yml` (orchestrator)
+- Entry point.
+- Defines target VM list and defaults.
+- Runs the per-VM workflow.
+- Writes final JSON report.
+
+### `per_vm_scan.yml` (per-VM workflow)
+- Handles one VM at a time.
+- Performs VM checks (running, Windows, snapshot availability).
+- Calls helper to run detector in guest.
+- Parses detector JSON.
+- Triggers stop/rollback/start if confirmed and remediation enabled.
+
+### `guest_stage_and_remediate.py` (execution helper)
+- Sends PowerShell script into guest in chunks using QEMU guest agent.
+- Retries transient QGA failures.
+- Executes script inside guest and collects output reliably.
+
+### `windows-behavioral-detect.ps1` (detector engine)
+- Runs inside the Windows VM.
+- Collects behavioral + IOC evidence.
+- Scores and classifies findings.
+- Emits one JSON object for Ansible to parse.
+
+---
+
+## 3) End-to-end workflow (simple timeline)
+
+For each VM:
+
+1. Read VM status and config from Proxmox.
+2. Skip if VM is not running or not Windows.
+3. In remediation mode, verify clean snapshot exists.
+4. Wait for guest agent.
+5. Copy helper and detector script to host.
+6. Helper stages detector script into guest.
+7. Helper runs detector script.
+8. Ansible parses detector JSON.
+9. If confirmed infected and remediation enabled:
+   - Stop VM
+   - Roll back to `pre-malware-421`
+   - Start VM
+10. Save per-VM result in final report.
+
+---
+
+## 4) Why `guest_stage_and_remediate.py` is important
+
+This helper is what makes execution stable.
+
+- It avoids huge one-shot command strings by chunking script payload.
+- It tolerates temporary QGA hiccups and retries.
+- It handles occasional `exec-status`/PID edge cases.
+- It returns clean stdout/stderr so JSON parsing is reliable.
+
+Without this helper, scans fail more often in real guest-agent conditions.
+
+---
+
+## 5) How `windows-behavioral-detect.ps1` decides infection
+
+The detector collects many indicators and then decides:
+
+- `likely_infected`
+- `confirmed_infection`
+- `decision_reason`
+- `confidence`
+
+It also reports:
+
+- family hit counters (`wannacry_hits`, `lokibot_hits`, `kovter_hits`, `defender_hits`)
+- `malware_family_detected`
+- `malware_evidence` (human-readable reasons)
+- all detailed indicators
+
+### Decision style
+
+The script supports:
+
+- **Family IOC confirmations** (high confidence): WannaCry/LokiBot/Kovter/Defender detections.
+- **Correlated behavioral detections** (medium confidence): multiple strong cross-category signals.
+- **Noise handling**: pure PowerShell noise alone should not confirm infection.
+
+---
+
+## 6) Malware-family logic (what each one looks for)
+
+## 6.1 WannaCry
+
+WannaCry logic remains high-confidence IOC based, including:
+
+- known artifact paths/names,
+- known process and service patterns,
+- `.wnry` and ransom note artifacts.
+
+If these hit, it is treated as confirmed infection quickly.
+
+No recent tuning changed WannaCry logic.
+
+---
+
+## 6.2 LokiBot (key improvement you requested)
+
+### Problem you had
+LokiBot previously detected from leftovers even when malware was not running.
+
+### Fix implemented
+LokiBot high-confidence detection was changed to **runtime-only** behavior:
+
+- LokiBot now confirms from live process evidence.
+- Dormant files/keys/tasks no longer count as LokiBot high-confidence IOC.
+
+### Result
+- **Not running** LokiBot -> no LokiBot confirmation.
+- **Running** LokiBot -> confirms with process evidence (name/PID/path/cmdline).
+
+This eliminated the false redeploy behavior you saw.
+
+---
+
+## 6.3 Kovter / Kovar (fileless-focused improvement)
+
+Kovter is harder because process chain can disappear quickly (fileless behavior).
+So the script now relies more on **post-execution residues**:
+
+1. Kovter-style registry payload structure checks (randomized key/value patterns + encoded content signals).
+2. Scriptblock signatures tied to Kovter-like stager behavior.
+
+### Important anti-false-positive tuning
+
+A single broad reflection marker (for example, only `DefineDynamicAssembly`) is no longer enough.
+
+Kovter scriptblock evidence must be correlated:
+
+- at least 2 execution/stager patterns, or
+- 1 execution/stager pattern + 1 support pattern.
+
+This is why your clean Kovter run stopped false-triggering.
+
+---
+
+## 7) Why your recent test outcomes make sense
+
+### Clean LokiBot VM (not running)
+- `lokibot_hits = 0`
+- decision stays non-confirming
+- no rollback
+
+### Running LokiBot VM
+- runtime process evidence appears
+- `decision_reason = lokibot_ioc_detected`
+- `malware_family_detected = lokibot`
+- rollback runs when enabled
+
+### Clean Kovter VM
+- generic PowerShell burst can still appear as low-score noise
+- but no Kovter correlation -> no confirmed infection
+
+### Infected Kovter VM
+- correlated Kovter signals trigger `kovter_ioc_detected`
+- rollback runs when enabled
+
+---
+
+## 8) Report fields you should read first
+
+For quick operator triage, focus on:
+
+- `status`
+- `confirmed_infection`
+- `decision_reason`
+- `malware_family_detected`
+- `malware_evidence`
+- family hit line (`wc/lb/kv/def`)
+
+If `malware_family_detected = none` and `confirmed_infection = false`, no remediation should occur.
+
+---
+
+## 9) Safe operating modes
+
+### Scan-only mode (recommended first pass)
+Use this to validate detections without rollback:
+
+`replace_infected=false`
+
+### Remediation mode
+Default behavior in this pipeline:
+
+- confirmed infection -> stop, rollback, start
+- snapshot is pinned and enforced
+
+---
+
+## 10) Snapshot safety guardrails
+
+Rollback is intentionally restricted to:
+
+- `pre-malware-421`
+
+Assertions in playbooks block accidental rollback to unexpected snapshot names.
+
+---
+
+## 11) Practical command patterns
+
+### Scan one VM only (no rollback)
+Run with:
+
+- target VM list limited to one VM
+- `replace_infected=false`
+
+### Scan + rollback one VM
+Run with:
+
+- target VM list limited to one VM
+- remediation enabled (default or explicit true)
+
+### Full configured run
+Runs against default target set in `scan.yml`.
+
+---
+
+## 12) What made this pipeline more capable (summary)
+
+1. **Execution reliability**: helper retries/chunking improved in-guest script delivery.
+2. **LokiBot precision**: runtime-only confirmation removed dormant artifact false positives.
+3. **Kovter coverage**: fileless residue + scriptblock correlation improved detectability.
+4. **Kovter stability**: tighter correlation rules reduced false positives.
+5. **Operator clarity**: explicit `malware_family_detected` and `malware_evidence` output.
+6. **Safety**: strict snapshot pin + controlled remediation path.
+
+---
+
+## 13) Quick troubleshooting notes
+
+### "provided hosts list is empty"
+Expected here. Play runs on localhost and delegates to `remediator`.
+
+### Many "skipped" tasks
+Normal when VM is off or in branch-gated sections.
+
+### QGA waits/polls
+Expected in helper execution; async polling is normal.
+
+### Suspicious detection when clean
+Check:
+- `malware_family_detected`
+- `malware_evidence`
+- whether signal is only generic powershell noise
+
+---
+
+## 14) Final operational advice
+
+- Validate new detection logic in scan-only mode first.
+- Confirm evidence fields match expected malware behavior.
+- Then enable rollback for automated cleanup.
+- Keep `pre-malware-421` snapshot healthy and current for reliable recovery.
+

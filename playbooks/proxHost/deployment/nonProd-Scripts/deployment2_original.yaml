@@ -1,0 +1,207 @@
+- name: Deployment 2 Small Workplace is deploying
+  hosts: localhost
+  gather_facts: no
+  become: true
+
+  vars:
+    ###########################################################################
+    # PROXMOX CONTROL
+    ###########################################################################
+    template_node: pve-node              # Node where templates + qm live
+    proxmox_target_node: pve-node    # Target Proxmox node name
+    proxmox_target_host: remediator
+
+    ###########################################################################
+    # NETWORK BRIDGE CONFIG
+    ###########################################################################
+    bridge_ip: "10.10.20.1"
+    bridge_netmask: "255.255.255.0"
+    bridge_cidr: "/24"
+
+    ###########################################################################
+    # VMID RANGE
+    ###########################################################################
+    vmid_start: 2000
+    vmid_end: 2100
+
+    ###########################################################################
+    # TEMPLATE VMIDS
+    ###########################################################################
+    win10_tmp: 3001
+    win_srv: 3003
+    ubu_srv: 3004
+    ubuntu: 3005
+    rocky: 3006
+
+    ###########################################################################
+    # VMS TO DEPLOY
+    ###########################################################################
+    vms:
+      - name: Workstation
+        template_vmid: "{{ win10_tmp }}"
+        cores: 4
+        memory: 8192
+
+      - name: Backend-server
+        template_vmid: "{{ win_srv }}"
+        cores: 4
+
+        memory: 16384
+
+      - name: Rocky-Station
+        template_vmid: "{{ rocky }}"
+        cores: 2
+        memory: 4096
+
+      - name: Zeek
+        template_vmid: "{{ ubuntu }}"
+        cores: 2
+        memory: 2048
+
+      - name: WebServer
+        template_vmid: "{{ ubu_srv }}"
+        cores: 2
+        memory: 2048
+
+  tasks:
+
+    ###########################################################################
+    # NETWORK BRIDGE LOGIC (IDEMPOTENT)
+    ###########################################################################
+
+    - name: Check if IP already exists anywhere on node
+      ansible.builtin.shell: |
+        ip -4 -o addr show | awk '{print $4}' | grep -qx "{{ bridge_ip }}{{ bridge_cidr }}"
+      register: ip_exists
+      failed_when: false
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Find interface that already owns the IP
+      ansible.builtin.shell: |
+        ip -4 -o addr show | awk '$4=="{{ bridge_ip }}{{ bridge_cidr }}" {print $2}'
+      register: ip_iface
+      failed_when: false
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Find next available vmbrX (only if IP unused)
+      ansible.builtin.shell: |
+        for i in $(seq 0 99); do
+          if ! ip link show vmbr$i >/dev/null 2>&1; then
+            echo vmbr$i
+            exit 0
+          fi
+        done
+        exit 1
+      args:
+        executable: /bin/bash
+      register: next_bridge
+      when: ip_exists.rc != 0
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Set bridge_name fact
+      ansible.builtin.set_fact:
+        bridge_name: >-
+          {{ (ip_iface.stdout | trim) if ip_exists.rc == 0 else (next_bridge.stdout | trim) }}
+
+    - name: Show selected bridge
+      ansible.builtin.debug:
+        msg: "Using {{ bridge_name }} for {{ bridge_ip }}{{ bridge_cidr }}"
+
+    - name: Create bridge config block (only if IP unused)
+      ansible.builtin.blockinfile:
+        path: /etc/network/interfaces
+        marker: "# {mark} ANSIBLE MANAGED {{ bridge_name }}"
+        block: |
+          auto {{ bridge_name }}
+          iface {{ bridge_name }} inet static
+            address {{ bridge_ip }}
+            netmask {{ bridge_netmask }}
+            bridge-ports none
+            bridge-stp off
+            bridge-fd 0
+      when: ip_exists.rc != 0
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Bring up bridge (only if created)
+      ansible.builtin.shell: |
+        ifup {{ bridge_name }}
+      when: ip_exists.rc != 0
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Verify bridge IP
+      ansible.builtin.shell: |
+        ip -4 -o addr show dev {{ bridge_name }} | awk '{print $4}' | grep -qx "{{ bridge_ip }}{{ bridge_cidr }}"
+      register: bridge_verify
+      failed_when: bridge_verify.rc != 0
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    ###########################################################################
+    # VMID ALLOCATION (NO jq)
+    ###########################################################################
+
+    - name: Get used VMIDs on target node
+      ansible.builtin.shell: |
+        qm list | awk 'NR>1 {print $1}'
+      register: used_vmids_raw
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Build used VMID list
+      ansible.builtin.set_fact:
+        used_vmids: "{{ used_vmids_raw.stdout_lines | map('int') | list }}"
+
+    - name: Build free VMID list in range
+      ansible.builtin.set_fact:
+        free_vmids: "{{ range(vmid_start, vmid_end + 1) | reject('in', used_vmids) | list }}"
+
+    - name: Verify sufficient free VMIDs
+      ansible.builtin.fail:
+        msg: "Not enough free VMIDs. Need {{ vms | length }}, found {{ free_vmids | length }}"
+      when: free_vmids | length < vms | length
+
+    - name: Attach VMIDs to VM plan
+      ansible.builtin.set_fact:
+        vm_plan: "{{ vm_plan | default([]) + [ item | combine({'new_vmid': free_vmids[idx]}) ] }}"
+      loop: "{{ vms }}"
+      loop_control:
+        index_var: idx
+
+    ###########################################################################
+    # CLONE + CONFIG + START (LINKED)
+    ###########################################################################
+
+    - name: Clone VMs (linked clone)
+      ansible.builtin.shell: |
+        qm clone "{{ item.template_vmid }}" "{{ item.new_vmid }}" \
+          --name "{{ item.name }}" \
+          --target "{{ proxmox_target_node }}" \
+          --full 0
+      loop: "{{ vm_plan }}"
+      delegate_to: "{{ template_node }}"
+
+    - name: Apply CPU / RAM / NET OPTIONS
+      ansible.builtin.shell: |
+        qm set "{{ item.new_vmid }}" \
+          --cores "{{ item.cores }}" \
+          --memory "{{ item.memory }}" \
+          --net0 "virtio,bridge={{ bridge_name }}"
+      loop: "{{ vm_plan }}"
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Ensure TPM uses raw
+      ansible.builtin.shell: |
+        if qm config {{ item.new_vmid }} | grep -q '^tpmstate0:'; then
+          qm set {{ item.new_vmid }} --tpmstate0 local-lvm:1
+        fi
+      loop: "{{ vm_plan }}"
+      delegate_to: "{{ proxmox_target_host }}"
+
+
+    - name: Start VMs
+      ansible.builtin.shell: |
+        qm start "{{ item.new_vmid }}"
+      loop: "{{ vm_plan }}"
+      delegate_to: "{{ proxmox_target_host }}"

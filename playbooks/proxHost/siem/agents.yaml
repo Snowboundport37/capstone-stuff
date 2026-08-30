@@ -1,0 +1,276 @@
+---
+# Installs Velociraptor agents on every running VM attached to target_bridge.
+# No SSH required — all commands go through qm guest exec.
+# VMs download the binary directly from GitHub (requires internet in each VM).
+#
+# Discovers VMs dynamically by scanning Proxmox VM configs for the bridge name.
+# Handles Linux and Windows VMs automatically based on Proxmox ostype.
+#
+# Requires server.yaml to have run first so that
+# /tmp/velociraptor-client.config.yaml exists on this Proxmox host.
+#
+# Required runtime variable (no default — must be passed with -e):
+#   target_bridge   Name of the Proxmox bridge to scan (e.g. vmbr2)
+#
+# Example:
+#   ansible-playbook -i inventory/hosts.yaml Siem/velociraptor/agents.yaml \
+#     -e "target_bridge=vmbr2"
+
+- name: Install Velociraptor agents on all VMs in bridge via QEMU agent
+  hosts: pve-node
+  become: yes
+  gather_facts: yes
+
+  vars:
+    velo_version: "v0.76.1"
+    velo_release: "v0.76"
+
+    velo_linux_url: >-
+      https://github.com/Velocidex/velociraptor/releases/download/{{ velo_release }}/velociraptor-{{ velo_version }}-linux-amd64-musl
+    velo_windows_url: >-
+      https://github.com/Velocidex/velociraptor/releases/download/{{ velo_release }}/velociraptor-{{ velo_version }}-windows-amd64.exe
+
+    bridge_temp_ip:     "10.10.0.254"
+    bridge_temp_prefix: "24"
+    http_serve_port:    "8181"
+
+    windows_ostypes:
+      - win10
+      - win11
+      - win2019
+      - win2022
+      - win2016
+      - win2012r2
+      - win8
+      - win7
+
+  tasks:
+
+    - name: Assert target_bridge was provided at runtime
+      ansible.builtin.assert:
+        that: target_bridge is defined
+        fail_msg: "You must pass -e target_bridge=vmbr2 (or your bridge name) on the command line."
+
+    - name: Assert client config exists on this host
+      ansible.builtin.stat:
+        path: /tmp/velociraptor-client.config.yaml
+      register: client_cfg_stat
+      failed_when: not client_cfg_stat.stat.exists
+
+    - name: Read client config so it can be pushed into VMs
+      ansible.builtin.slurp:
+        src: /tmp/velociraptor-client.config.yaml
+      register: client_cfg_b64
+
+    - name: Discover all running VMs on {{ target_bridge }} and install agents
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json, subprocess, socket, sys, base64, textwrap
+
+        NODE            = socket.gethostname().split(".")[0]
+        TARGET_BRIDGE   = "{{ target_bridge }}"
+        LINUX_BIN_URL   = "{{ velo_linux_url }}"
+        WINDOWS_BIN_URL = "{{ velo_windows_url }}"
+        CLIENT_CFG_B64  = "{{ client_cfg_b64.content }}"
+
+        WINDOWS_OSTYPES = set({{ windows_ostypes | tojson }})
+
+        results = []
+
+        # ── Helpers ──────────────────────────────────────────────────────────
+
+        def exec_vm(vmid, cmd_list):
+            r = subprocess.run(
+                ["qm", "guest", "exec", str(vmid), "--"] + cmd_list,
+                capture_output=True, text=True
+            )
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.strip())
+            result = json.loads(r.stdout)
+            out  = result.get("out-data", "").strip()
+            err  = result.get("err-data", "").strip()
+            code = result.get("exitcode", 0)
+            if code != 0:
+                raise RuntimeError(f"command exited {code}: {err or out}")
+            return out, code
+
+        def shell_linux(vmid, cmd):
+            return exec_vm(vmid, ["bash", "-c", cmd])
+
+        def shell_windows(vmid, cmd):
+            return exec_vm(vmid, [
+                "powershell.exe", "-NonInteractive", "-NoProfile",
+                "-ExecutionPolicy", "Bypass", "-Command", cmd
+            ])
+
+        def agent_alive(vmid):
+            r = subprocess.run(["qm", "agent", str(vmid), "ping"], capture_output=True)
+            return r.returncode == 0
+
+        def push_file_linux(vmid, content_b64, dest_path, mode="600"):
+            """Write a base64-encoded file into a Linux VM."""
+            shell_linux(vmid, f"echo '{content_b64}' | base64 -d > {dest_path} && chmod {mode} {dest_path}")
+
+        def push_file_windows(vmid, content_b64, dest_path):
+            """Write a base64-encoded file into a Windows VM via PowerShell."""
+            shell_windows(vmid,
+                f"[System.IO.File]::WriteAllBytes('{dest_path}', "
+                f"[System.Convert]::FromBase64String('{content_b64}'))")
+
+        # ── Discover VMs on target bridge ─────────────────────────────────────
+
+        r = subprocess.run(
+            ["pvesh", "get", f"/nodes/{NODE}/qemu", "--output-format", "json"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(json.dumps({"error": r.stderr.strip()}))
+            sys.exit(1)
+
+        all_vms = json.loads(r.stdout)
+        target_vms = []
+
+        for vm in all_vms:
+            if vm.get("status") != "running":
+                continue
+            vmid = vm["vmid"]
+            cfg_r = subprocess.run(
+                ["pvesh", "get", f"/nodes/{NODE}/qemu/{vmid}/config", "--output-format", "json"],
+                capture_output=True, text=True
+            )
+            if cfg_r.returncode != 0:
+                continue
+            cfg = json.loads(cfg_r.stdout)
+            on_bridge = any(
+                TARGET_BRIDGE in str(v)
+                for k, v in cfg.items()
+                if k.startswith("net")
+            )
+            if not on_bridge:
+                continue
+            target_vms.append({
+                "vmid":   vmid,
+                "name":   vm.get("name", str(vmid)),
+                "ostype": cfg.get("ostype", "other")
+            })
+
+        # Optional: filter to a single VMID for testing
+        ONLY_VMID = "{{ target_vmid | default('') }}"
+        if ONLY_VMID:
+            target_vms = [v for v in target_vms if str(v["vmid"]) == ONLY_VMID]
+
+        print(f"Found {len(target_vms)} VM(s) on {TARGET_BRIDGE}: "
+              f"{[v['name'] for v in target_vms]}", flush=True)
+
+        # ── Install agent on each VM ──────────────────────────────────────────
+
+        for vm in target_vms:
+            vmid   = vm["vmid"]
+            name   = vm["name"]
+            ostype = vm["ostype"]
+            is_win = ostype in WINDOWS_OSTYPES
+
+            entry = {"vmid": vmid, "name": name, "ostype": ostype, "success": False, "error": ""}
+
+            if not agent_alive(vmid):
+                entry["error"] = "QEMU agent not responding — skipped"
+                results.append(entry)
+                print(f"  SKIP {name}: agent not responding", flush=True)
+                continue
+
+            try:
+                print(f"  Installing on {name} (VMID={vmid}, os={ostype})...", flush=True)
+
+                if is_win:
+                    # ── Windows ──────────────────────────────────────────────
+                    shell_windows(vmid,
+                        "Stop-Service -Name Velociraptor -Force -ErrorAction SilentlyContinue; "
+                        "sc.exe delete Velociraptor; "
+                        "Stop-Process -Name velociraptor -Force -ErrorAction SilentlyContinue; "
+                        "Start-Sleep -Seconds 2")
+                    shell_windows(vmid,
+                        "New-Item -ItemType Directory -Force -Path C:\\Velociraptor | Out-Null")
+                    shell_windows(vmid,
+                        "Add-MpPreference -ExclusionPath C:\\Velociraptor "
+                        "-ErrorAction SilentlyContinue")
+                    shell_windows(vmid,
+                        f"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+                        f"Invoke-WebRequest -Uri '{WINDOWS_BIN_URL}' "
+                        f"-OutFile C:\\Velociraptor\\velociraptor.exe -UseBasicParsing")
+                    shell_windows(vmid,
+                        "Unblock-File -Path C:\\Velociraptor\\velociraptor.exe")
+                    push_file_windows(vmid, CLIENT_CFG_B64, "C:\\Velociraptor\\client.config.yaml")
+                    shell_windows(vmid,
+                        "sc.exe create Velociraptor "
+                        "binPath= \"C:\\Velociraptor\\velociraptor.exe "
+                        "--config C:\\Velociraptor\\client.config.yaml service run\" "
+                        "start= auto DisplayName= Velociraptor")
+                    shell_windows(vmid,
+                        "New-Item -ItemType Directory -Force "
+                        "-Path 'C:\\Program Files\\Velociraptor' | Out-Null; "
+                        "New-Item -ItemType Directory -Force "
+                        "-Path 'C:\\Program Files\\Velociraptor\\Tools' | Out-Null")
+                    shell_windows(vmid, "sc.exe config Velociraptor start= auto")
+                    shell_windows(vmid, "sc.exe start Velociraptor")
+                    out, _ = shell_windows(vmid,
+                        "(Get-Service -Name Velociraptor -ErrorAction SilentlyContinue).Status")
+                    entry["service_status"] = out.strip()
+
+                else:
+                    # ── Linux ─────────────────────────────────────────────────
+                    shell_linux(vmid,
+                        f"if command -v curl >/dev/null 2>&1; then "
+                        f"  curl -fsSL '{LINUX_BIN_URL}' -o /usr/local/bin/velociraptor; "
+                        f"else "
+                        f"  wget -qO /usr/local/bin/velociraptor '{LINUX_BIN_URL}'; "
+                        f"fi && chmod 755 /usr/local/bin/velociraptor")
+                    shell_linux(vmid, "mkdir -p /etc/velociraptor")
+                    push_file_linux(vmid, CLIENT_CFG_B64, "/etc/velociraptor/client.config.yaml", "600")
+                    svc_unit = textwrap.dedent("""\
+                        [Unit]
+                        Description=Velociraptor DFIR Client
+                        After=network.target
+
+                        [Service]
+                        Type=simple
+                        User=root
+                        ExecStart=/usr/local/bin/velociraptor --config /etc/velociraptor/client.config.yaml client -v
+                        Restart=on-failure
+                        RestartSec=5
+                        LimitNOFILE=65536
+
+                        [Install]
+                        WantedBy=multi-user.target
+                        """)
+                    svc_b64 = base64.b64encode(svc_unit.encode()).decode()
+                    shell_linux(vmid,
+                        f"echo '{svc_b64}' | base64 -d "
+                        f"> /etc/systemd/system/velociraptor_client.service")
+                    shell_linux(vmid,
+                        "systemctl daemon-reload && systemctl enable --now velociraptor_client")
+                    out, _ = shell_linux(vmid,
+                        "systemctl is-active velociraptor_client 2>/dev/null || echo unknown")
+                    entry["service_status"] = out.strip()
+
+                entry["success"] = True
+                print(f"  OK {name}: {entry.get('service_status', '')}", flush=True)
+
+            except Exception as e:
+                entry["error"] = str(e)
+                print(f"  FAIL {name}: {e}", flush=True)
+
+            results.append(entry)
+
+        # ── Summary ───────────────────────────────────────────────────────────
+        ok   = sum(1 for r in results if r["success"])
+        fail = sum(1 for r in results if not r["success"])
+        print(json.dumps({"total": len(results), "ok": ok, "failed": fail, "vms": results}))
+        PYEOF
+      args:
+        executable: /bin/bash
+      register: agent_result
+
+    - name: Show per-VM results
+      ansible.builtin.debug:
+        msg: "{{ agent_result.stdout_lines }}"
+

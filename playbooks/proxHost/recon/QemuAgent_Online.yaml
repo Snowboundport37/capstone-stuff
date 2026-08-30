@@ -1,0 +1,16 @@
+- name: Enable QEMU Guest Agent on all Proxmox VMs
+  hosts: ProxmoxServers
+  become: yes
+  tasks:
+
+    - name: Lists the VMS present
+      shell: qm list | awk 'NR>1 {print $1}'
+      register: vm_list
+      changed_when: false
+
+    - name: Enables Qemu Guest agent for all vms
+      command: qm set {{ item }} --agent enabled=1
+      loop: "{{ vm_list.stdout_lines }}"
+      register: result
+      changed_when: "'Update VM' in result.stderr or result.rc == 0"
+

@@ -1,0 +1,128 @@
+- name: Deployment 1 is deploying
+  hosts: localhost
+  gather_facts: no
+  become: true
+
+  vars:
+    ###########################################################################
+    # PROXMOX CONTROL
+    ###########################################################################
+    template_node: "10.10.40.210"             # Node where templates + qm live
+    proxmox_target_node: "pve-node"    # Target Proxmox node name
+    proxmox_target_host: localhost
+
+    ###########################################################################
+    # NETWORK BRIDGE CONFIG
+    ###########################################################################
+    bridge_ip: "10.10.20.1"
+    bridge_netmask: "255.255.255.0"
+    bridge_cidr: "/24"
+
+    ###########################################################################
+    # VMID RANGE
+    ###########################################################################
+    vmid_start: 2000
+    vmid_end: 2100
+
+    ###########################################################################
+    # TEMPLATE VMIDS
+    ###########################################################################
+    win10: 3001
+    win11: 3002
+    win_srv: 3003
+    ubu_srv: 3004
+    ubuntu: 3005
+    rocky: 3006
+    kali: 3007
+    vyos: 3008
+    pfsense: 3009
+    vyos_gw: 3010
+    vyos_dhcp: 3011
+
+    ###########################################################################
+    # VMS TO DEPLOY
+    ###########################################################################
+    vms:
+      - name: win10-wks-01
+        template_vmid: "{{ win10 }}"
+
+      - name: win10-wks-02
+        template_vmid: "{{ win10 }}"
+
+      - name: ubuntu-srv-01
+        template_vmid: "{{ ubu_srv }}"
+
+      - name: ubuntu-srv-02
+        template_vmid: "{{ ubu_srv }}"
+
+      - name: ubuntu-srv-03
+        template_vmid: "{{ ubu_srv }}"
+
+      - name: rocky-01
+        template_vmid: "{{ rocky }}"
+
+      - name: rocky-02
+        template_vmid: "{{ rocky }}"
+
+      - name: kali-01
+        template_vmid: "{{ kali }}"
+
+      - name: vyos-gw
+        template_vmid: "{{ vyos }}"
+
+      - name: vyos-dhcp
+        template_vmid: "{{ vyos_dhcp }}"
+
+  tasks:
+
+    ###########################################################################
+    # VMID ALLOCATION (NO jq)
+    ###########################################################################
+
+    - name: Get used VMIDs on target node
+      ansible.builtin.shell: |
+        qm list | awk 'NR>1 {print $1}'
+      register: used_vmids_raw
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Build used VMID list
+      ansible.builtin.set_fact:
+        used_vmids: "{{ used_vmids_raw.stdout_lines | map('int') | list }}"
+
+    - name: Build free VMID list in range
+      ansible.builtin.set_fact:
+        free_vmids: "{{ range(vmid_start, vmid_end + 1) | reject('in', used_vmids) | list }}"
+
+    - name: Verify sufficient free VMIDs
+      ansible.builtin.fail:
+        msg: "Not enough free VMIDs. Need {{ vms | length }}, found {{ free_vmids | length }}"
+      when: free_vmids | length < vms | length
+
+    - name: Attach VMIDs to VM plan
+      ansible.builtin.set_fact:
+        vm_plan: "{{ vm_plan | default([]) + [ item | combine({'new_vmid': free_vmids[idx]}) ] }}"
+      loop: "{{ vms }}"
+      loop_control:
+        index_var: idx
+
+    ###########################################################################
+    # CLONE + CONFIG
+    ###########################################################################
+
+    - name: Clone VMs (linked clone)
+      ansible.builtin.shell: |
+        qm clone "{{ item.template_vmid }}" "{{ item.new_vmid }}" \
+          --name "{{ item.name }}" \
+          --target "{{ proxmox_target_node }}" \
+          --full 0
+      loop: "{{ vm_plan }}"
+      delegate_to: "{{ template_node }}"
+
+    - name: Ensure TPM uses raw
+      ansible.builtin.shell: |
+        if qm config {{ item.new_vmid }} | grep -q '^tpmstate0:'; then
+          qm set {{ item.new_vmid }} --tpmstate0 local-lvm:1
+        fi
+      loop: "{{ vm_plan }}"
+      delegate_to: "{{ proxmox_target_host }}"

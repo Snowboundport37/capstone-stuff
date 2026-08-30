@@ -1,0 +1,299 @@
+---
+###########################################################################
+# DEPLOYMENT 1 REMASTERED
+# Unified pipeline: Proxmox VM provisioning + guest network configuration
+#
+# Phases:
+#   0  — Host registration + global VMID query
+#   1  — Per-user: bridge setup, VMID allocation, master list building
+#   2  — Clone all VMs (throttled, idempotent)
+#   3  — Configure Proxmox VM settings: NICs, CPU, RAM (async/parallel)
+#   4  — Collect LAN-bridge MAC addresses (needed to match guest interface)
+#   5  — Start all VMs
+#   6  — Configure guest networking via QEMU agent (per-VM)
+#   7  — Pool membership
+###########################################################################
+
+- name: Deployment 1 Remastered — Deploy VMs and Configure Guest Networking
+  hosts: localhost
+  gather_facts: no
+  become: true
+  vars_files:
+    - roster.yaml
+  vars:
+    template_node: pve-node
+    proxmox_target_node: pve-node
+    proxmox_target_host: remediator
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    bridge_netmask: "255.255.255.0"
+    bridge_cidr: "/24"
+
+    vmid_start: 2000
+    vmid_end: 2100
+
+    vyos_template_vmid: 3008
+    vyos_cores: 1
+    vyos_memory: 2048
+
+    # Clone tuning
+    clone_throttle: 2     # max simultaneous clones
+    clone_retries: 4      # retries on Proxmox CFS lock
+    clone_delay: 1        # seconds between retries
+
+    # Guest agent polling (used by tasks/configure_vm.yml)
+    agent_timeout: 120
+    agent_poll_interval: 5
+
+    # Accumulated during Phase 1 setup
+    master_clone_list:   []   # [{src_vmid, new_vmid, name}]
+    master_vm_configs:   []   # [{new_vmid, cores, memory, bridge}]
+    master_vyos_configs: []   # [{vmid, name, cores, memory, wan_bridge, lan_bridge}]
+    master_pool_vmids:   []   # flat list of all VMIDs
+    master_ip_plan:      []   # [{vmid, name, lan_bridge, assigned_ip, assigned_prefix, gateway, dns_servers}]
+    master_pool_plan:    []   # [{pool_name, user_name, vmids}]
+    master_assignments:  []   # master_ip_plan + mac field (built in Phase 4)
+    claimed_vmids:       []
+    global_used_vmids:   []
+
+  tasks:
+
+    #######################################################################
+    # PHASE 0: HOST REGISTRATION
+    #######################################################################
+
+    - name: Add pve-node host
+      ansible.builtin.add_host:
+        name: pve-node
+        ansible_host: 10.10.0.1
+        ansible_port: 49152
+        ansible_user: root
+        ansible_password: "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    - name: Add remediator host
+      ansible.builtin.add_host:
+        name: remediator
+        ansible_host: 10.10.0.1
+        ansible_port: 49154
+        ansible_user: root
+        ansible_password: "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    - name: Get all used VMIDs on target node
+      ansible.builtin.shell: qm list | awk 'NR>1 {print $1}'
+      register: vmids_on_target
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Get all used VMIDs on template node
+      ansible.builtin.shell: qm list | awk 'NR>1 {print $1}'
+      register: vmids_on_template
+      changed_when: false
+      delegate_to: "{{ template_node }}"
+
+    - name: Build global used VMID list
+      ansible.builtin.set_fact:
+        global_used_vmids: >-
+          {{ (vmids_on_target.stdout_lines + vmids_on_template.stdout_lines)
+             | map('int') | unique | list }}
+
+    #######################################################################
+    # PHASE 1: SETUP — bridges + VMID allocation + master lists
+    #######################################################################
+
+    - name: Setup each user
+      include_tasks: setup_user.yaml
+      loop: "{{ users }}"
+      loop_control:
+        loop_var: current_user
+
+    #######################################################################
+    # PHASE 2: CLONE ALL VMS (throttled, idempotent)
+    #######################################################################
+
+    - name: "CLONE {{ item.name }} ({{ item.src_vmid }} -> {{ item.new_vmid }})"
+      ansible.builtin.shell: |
+        if qm status {{ item.new_vmid }} >/dev/null 2>&1; then
+          echo "SKIP: {{ item.name }} already exists"
+          exit 0
+        fi
+        qm clone "{{ item.src_vmid }}" "{{ item.new_vmid }}" \
+          --name "{{ item.name }}" \
+          --target "{{ proxmox_target_node }}" \
+          --full 0 2>&1
+      register: clone_result
+      until: >-
+        clone_result.rc == 0 or
+        'already exists' in (clone_result.stdout | default(''))
+      retries: "{{ clone_retries }}"
+      delay: "{{ clone_delay }}"
+      failed_when: >-
+        clone_result.rc != 0 and
+        'already exists' not in (clone_result.stdout | default('')) and
+        'already exists' not in (clone_result.stderr | default(''))
+      loop: "{{ master_clone_list }}"
+      throttle: "{{ clone_throttle }}"
+      delegate_to: "{{ template_node }}"
+
+    #######################################################################
+    # PHASE 3: CONFIGURE PROXMOX VM SETTINGS — NICs, CPU, RAM (async)
+    #######################################################################
+
+    - name: "Config VyOS {{ item.name }} — remove inherited NICs + set resources"
+      ansible.builtin.shell: |
+        for nic in $(qm config {{ item.vmid }} | grep -oP '^net\d+'); do
+          qm set {{ item.vmid }} --delete $nic
+        done
+        qm set "{{ item.vmid }}" \
+          --cores {{ item.cores }} \
+          --memory {{ item.memory }} \
+          --net0 "virtio,bridge={{ item.wan_bridge }}" \
+          --net1 "virtio,bridge={{ item.lan_bridge }}"
+      loop: "{{ master_vyos_configs }}"
+      async: 120
+      poll: 0
+      register: vyos_jobs
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "Config VM {{ item.new_vmid }} CPU/RAM/NET"
+      ansible.builtin.shell: |
+        qm set "{{ item.new_vmid }}" \
+          --cores "{{ item.cores | int }}" \
+          --memory "{{ item.memory | int }}" \
+          --net0 "virtio,bridge={{ item.bridge }}"
+      loop: "{{ master_vm_configs }}"
+      async: 120
+      poll: 0
+      register: config_jobs
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "Fix TPM {{ item.new_vmid }}"
+      ansible.builtin.shell: |
+        if qm config {{ item.new_vmid }} | grep -q '^tpmstate0:'; then
+          qm set {{ item.new_vmid }} --tpmstate0 local-lvm:1
+        fi
+      loop: "{{ master_vm_configs }}"
+      async: 120
+      poll: 0
+      register: tpm_jobs
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait for VyOS configs
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ vyos_jobs.results }}"
+      register: r
+      until: r.finished
+      retries: 30
+      delay: 2
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait for VM configs
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ config_jobs.results }}"
+      register: r
+      until: r.finished
+      retries: 30
+      delay: 2
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait for TPM fixes
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ tpm_jobs.results }}"
+      register: r
+      until: r.finished
+      retries: 30
+      delay: 2
+      delegate_to: "{{ proxmox_target_host }}"
+
+    #######################################################################
+    # PHASE 4: COLLECT LAN-BRIDGE MAC ADDRESSES
+    # Read qm config after NICs are committed so we know which MAC maps to
+    # the LAN bridge interface inside the guest.
+    #######################################################################
+
+    - name: Get LAN-bridge MAC for each VM
+      ansible.builtin.shell: |
+        qm config {{ item.vmid }} \
+          | grep -E 'net[0-9]+:.*bridge={{ item.lan_bridge }}' \
+          | grep -oP '[0-9A-Fa-f:]{17}' | head -1
+      loop: "{{ master_ip_plan }}"
+      register: mac_results
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Build final assignment list with MACs
+      ansible.builtin.set_fact:
+        master_assignments: >-
+          {{ master_assignments + [
+               master_ip_plan[ansible_loop.index0] | combine({'mac': item.stdout | trim})
+             ] }}
+      loop: "{{ mac_results.results }}"
+      loop_control:
+        extended: true
+        label: "{{ master_ip_plan[ansible_loop.index0].name }}"
+
+    - name: Show planned IP assignments
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.name }} (VMID {{ item.vmid }})
+          -> {{ item.assigned_ip }}/{{ item.assigned_prefix }}
+          MAC={{ item.mac }}
+      loop: "{{ master_assignments }}"
+
+    #######################################################################
+    # PHASE 5: START ALL VMS
+    #######################################################################
+
+    - name: Start all VMs
+      ansible.builtin.shell: |
+        if qm status {{ item }} | grep -q 'stopped'; then
+          qm start {{ item }}
+        fi
+      loop: "{{ master_pool_vmids }}"
+      async: 120
+      poll: 0
+      register: start_jobs
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait for all VMs to start
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ start_jobs.results }}"
+      register: r
+      until: r.finished
+      retries: 30
+      delay: 2
+      delegate_to: "{{ proxmox_target_host }}"
+
+    #######################################################################
+    # PHASE 6: GUEST NETWORKING — configure IP inside each VM via QEMU agent
+    # configure_vm.yml receives the full vm object (vmid, name, mac,
+    # lan_bridge, assigned_ip, assigned_prefix, gateway, dns_servers).
+    #######################################################################
+
+    - name: Configure guest networking for each VM
+      include_tasks: tasks/configure_vm.yml
+      vars:
+        vm: "{{ outer_vm }}"
+      loop: "{{ master_assignments }}"
+      loop_control:
+        loop_var: outer_vm
+        label: "VMID {{ outer_vm.vmid }} ({{ outer_vm.name }})"
+
+    #######################################################################
+    # PHASE 7: POOL MEMBERSHIP — create per-user pools and add VMs
+    #######################################################################
+
+    - name: Create and populate per-user pools
+      ansible.builtin.shell: |
+        pvesh get /pools/{{ item.pool_name }} --noborder 1 >/dev/null 2>&1 || \
+        pvesh create /pools \
+          --poolid {{ item.pool_name }} \
+          --comment "Deployment 1 Remastered — {{ item.user_name }}"
+        pvesh set /pools/{{ item.pool_name }} --vms {{ item.vmids | join(',') }}
+      loop: "{{ master_pool_plan }}"
+      delegate_to: "{{ template_node }}"

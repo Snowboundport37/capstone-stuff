@@ -1,0 +1,59 @@
+- name: Clone a singular VM for redeployment on proxnode
+  hosts: pve-node
+  gather_facts: no
+
+  vars:
+    source_vmid: 1001
+    new_vm_name: "Win10-Clone"
+    full_clone: no
+    storage: "local-lvm"
+    start_vm: yes
+
+    vmid_range_start: 2000
+    vmid_range_end: 3000
+
+
+  tasks:
+    - name: get list of available VM id's in range.
+      shell: |
+        existing=$(qm list | awk 'NR>1 {print $1}')
+        for id in $(seq {{ vmid_range_start }} {{ vmid_range_end }}); do
+          if ! echo "$existing" | grep -q "^${id}$"; then
+            echo $id
+            exit 0
+          fi
+        done
+        exit 1
+      register: available_vmid
+      failed_when: available_vmid.rc != 0
+      changed_when: false
+
+    - name: set new vm_id variable
+      set_fact:
+        new_vmid: "{{ available_vmid.stdout | trim }}"
+
+    - name: clone VM
+      shell: >
+        qm clone {{ source_vmid }} {{ new_vmid }}
+        --name {{ new_vm_name }}
+      register: clone_result
+      changed_when: clone_result.rc == 0
+
+    - name: display clone result
+      debug:
+        msg: "VM cloned successfully. New VMID: {{ new_vmid }}, Name: {{ new_vm_name }}"
+      when: clone_result.rc == 0
+
+    - name: Start the cloned VM
+      shell: qm start {{ new_vmid }}
+      when:
+        - clone_result.rc == 0
+        - start_vm | bool
+      register: start_result
+
+    - name: Display start result
+      debug:
+        msg: "VM: {{ new_vmid }} has been started successfully"
+      when:
+        - start_vm | bool
+        - start_result.rc == 0

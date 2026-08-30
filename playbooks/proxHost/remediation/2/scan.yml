@@ -1,0 +1,217 @@
+---
+###############################################################################
+# scan.yml
+# Entry point for malware detection + remediation pipeline.
+#
+# Usage:
+#   ansible-playbook playbooks/proxHost/remediation/2/scan.yml
+#   ansible-playbook playbooks/proxHost/remediation/2/scan.yml -e replace_infected=false   # scan only, no rollback
+#   ansible-playbook playbooks/proxHost/remediation/2/scan.yml -e detection_score_threshold=5
+#
+# Targets all QEMU VMIDs >= 2004 on pve-node by default.
+# Report is written to /tmp/remediation_report_<timestamp>.json on the
+# Ansible controller.
+###############################################################################
+
+- name: Malware Detection and Remediation Pipeline
+  hosts: localhost
+  gather_facts: no
+
+  vars:
+    # ── Proxmox infra ──────────────────────────────────────────────────────
+    proxmox_target_host: remediator
+    proxmox_target_node: pve-node
+
+    # ── Target VM selection ────────────────────────────────────────────────
+    # If target_vmids is empty, discover all QEMU VMs on the node and filter
+    # by min_vmid_for_scan.
+    target_vmids:
+      - vmid: 2004
+        label: wannacry-ASCII
+      - vmid: 2005
+        label: lokibot-ASCII
+      - vmid: 2015
+        label: kovter-ascii
+    min_vmid_for_scan: 2004
+
+    # ── Snapshot to roll back to on remediation ────────────────────────────
+    # Pinned intentionally: remediation is only allowed to roll back to this snapshot.
+    clean_snapshot: pre-malware-421
+
+    # ── Helper script locations on controller ─────────────────────────────
+    helper_dir: "{{ playbook_dir }}"
+
+    # ── Detection tuning ──────────────────────────────────────────────────
+    detection_score_threshold:            12
+    detection_min_strong_hits:            2
+    detection_min_categories:             2
+    detection_lookback_hours:             24
+    detection_high_cpu_seconds:           3
+    detection_high_memory_mb:             500
+    detection_powershell_burst_threshold: 5
+    detection_stager_recent_minutes:      15
+    detection_require_ps_stager_obfuscation: false
+    detection_enable_registry_blob_scan:  false
+    detection_overrides_by_vmid:
+      "2004":
+        detection_require_ps_stager_obfuscation: true
+
+    # ── Remediation behaviour ─────────────────────────────────────────────
+    replace_infected:     true    # set false to scan without nuking
+    start_redeployed_vm:  true    # start VM after rollback
+
+    # ── Guest exec tuning (passed through to python helper) ───────────────
+    guest_exec_timeout_seconds:   180
+    guest_chunk_size:             8000
+    guest_chunk_write_attempts:   8
+    helper_max_runtime_seconds:   300
+    helper_poll_seconds:          10
+
+    # ── Report output ─────────────────────────────────────────────────────
+    report_dir:  /tmp
+    report_time: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+    # Accumulator — do not override
+    remediation_report_entries: []
+
+  tasks:
+
+    ###########################################################################
+    # PHASE 0: HOST REGISTRATION
+    ###########################################################################
+
+    - name: Register remediator host
+      ansible.builtin.add_host:
+        name: remediator
+        ansible_host:            10.10.0.1
+        ansible_port:            49154
+        ansible_user:            root
+        ansible_password:        "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    ###########################################################################
+    # PHASE 1: PER-VM SCAN + REMEDIATION
+    ###########################################################################
+
+    - name: Record pipeline start time
+      ansible.builtin.set_fact:
+        pipeline_start_time:      "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        pipeline_start_epoch:     "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: Validate remediation snapshot is pinned
+      ansible.builtin.assert:
+        that:
+          - clean_snapshot == 'pre-malware-421'
+        fail_msg: "clean_snapshot must be exactly 'pre-malware-421'. Refusing to run with any other snapshot."
+
+    - name: Discover QEMU VMs on Proxmox node
+      when: (target_vmids | length) == 0
+      ansible.builtin.command:
+        argv:
+          - pvesh
+          - get
+          - "/nodes/{{ proxmox_target_node }}/qemu"
+          - --output-format
+          - json
+      register: discovered_qemu_vms
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Build target VM list from discovered inventory
+      when: (target_vmids | length) == 0
+      ansible.builtin.set_fact:
+        resolved_target_vmids: >-
+          {%- set out = [] -%}
+          {%- for vm in (discovered_qemu_vms.stdout | from_json | sort(attribute='vmid')) -%}
+          {%-   if (vm.vmid | int) >= (min_vmid_for_scan | int) -%}
+          {%-     set _ = out.append({
+                    'vmid': (vm.vmid | int),
+                    'label': (vm.name | default('VM-' ~ (vm.vmid | string)))
+                  }) -%}
+          {%-   endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Use explicit target VM list when provided
+      when: (target_vmids | length) > 0
+      ansible.builtin.set_fact:
+        resolved_target_vmids: "{{ target_vmids }}"
+
+    - name: Show resolved target VM list
+      ansible.builtin.debug:
+        msg:
+          - "Resolved targets (VMID >= {{ min_vmid_for_scan }} when auto-discovered): {{ resolved_target_vmids }}"
+
+    - name: Process next VM
+      include_tasks: per_vm_scan.yml
+      vars:
+        current_vmid: "{{ item.vmid }}"
+      loop: "{{ resolved_target_vmids }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    ###########################################################################
+    # PHASE 2: WRITE REPORT
+    ###########################################################################
+
+    - name: Record pipeline end time
+      ansible.builtin.set_fact:
+        pipeline_end_time:  "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        pipeline_end_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: Build report payload
+      ansible.builtin.set_fact:
+        final_report:
+          report_generated_at:      "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          score_threshold:          "{{ detection_score_threshold }}"
+          clean_snapshot:           "{{ clean_snapshot }}"
+          pipeline_start_time:      "{{ pipeline_start_time }}"
+          pipeline_end_time:        "{{ pipeline_end_time }}"
+          pipeline_duration_seconds: "{{ (pipeline_end_epoch | int) - (pipeline_start_epoch | int) }}"
+          vms_scanned:              "{{ remediation_report_entries | length }}"
+          vms_infected:             "{{ remediation_report_entries | selectattr('likely_infected', 'defined') | selectattr('likely_infected') | list | length }}"
+          vms_redeployed:           "{{ remediation_report_entries | selectattr('status', 'defined') | selectattr('status', 'equalto', 'redeployed') | list | length }}"
+          results:                  "{{ remediation_report_entries }}"
+
+    - name: Write JSON report to controller
+      ansible.builtin.copy:
+        content:  "{{ final_report | to_nice_json }}"
+        dest:     "{{ report_dir }}/remediation_report_{{ report_time }}.json"
+        mode:     '0644'
+
+    - name: Print report summary
+      ansible.builtin.debug:
+        msg:
+          - "══════════════════════════════════════════"
+          - "  Malware Detection Report"
+          - "══════════════════════════════════════════"
+          - "  Started:        {{ final_report.pipeline_start_time }}"
+          - "  Finished:       {{ final_report.pipeline_end_time }}"
+          - "  Duration:       {{ final_report.pipeline_duration_seconds }}s"
+          - "──────────────────────────────────────────"
+          - "  VMs scanned:    {{ final_report.vms_scanned }}"
+          - "  VMs infected:   {{ final_report.vms_infected }}"
+          - "  VMs redeployed: {{ final_report.vms_redeployed }}"
+          - "──────────────────────────────────────────"
+          - "  Full report: {{ report_dir }}/remediation_report_{{ report_time }}.json"
+          - "══════════════════════════════════════════"
+
+    - name: Print per-VM results
+      ansible.builtin.debug:
+        msg:
+          - "  VM      : {{ item.vm_name | default('VMID ' ~ item.vmid) }}"
+          - "  Status  : {{ item.status | default('unknown') }}"
+          - "  Reason  : {{ item.reason | default(item.remediation_action | default('n/a')) }}"
+          - "  Score   : {{ item.detection_score | default('N/A') }} / threshold {{ item.detection_result.threshold | default(detection_score_threshold) }}"
+          - "  Confirmed: {{ item.confirmed_infection | default(item.likely_infected | default(false)) }}"
+          - "  Decision: {{ item.detection_result.decision_reason | default('n/a') }}"
+          - "  Malware family: {{ item.detection_result.malware_family_detected | default('none') }}"
+          - "  Family hits: wc={{ item.detection_result.wannacry_hits | default(0) }} lb={{ item.detection_result.lokibot_hits | default(0) }} kv={{ item.detection_result.kovter_hits | default(0) }} def={{ item.detection_result.defender_hits | default(0) }}"
+          - "  Indicators: {{ (item.detection_result.indicators | default([])) | length }}"
+          - "  Malware evidence: {{ (item.detection_result.malware_evidence | default([]) | join(' || ')) | default('none', true) }}"
+          - "  Detected: {{ item.detected_at | default('N/A') }}"
+          - "  Nuked   : {{ item.nuked_at | default('N/A') }}"
+          - "  Restored: {{ item.redeployed_at | default('N/A') }}"
+      loop: "{{ remediation_report_entries }}"
+      loop_control:
+        label: "{{ item.vm_name | default(item.vmid) }}"

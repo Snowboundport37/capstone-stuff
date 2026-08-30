@@ -1,0 +1,28 @@
+---
+- name: Deployment 2 - Flexible VM Deploy
+  hosts: localhost
+  gather_facts: no
+  become: true
+  vars_files:
+    - roster.yaml
+  vars:
+    template_node: pve-node
+    proxmox_target_node: pve-node
+    proxmox_target_host: remediator
+
+    bridge_netmask: "255.255.255.0"
+    bridge_cidr: "/24"
+
+    vmid_start: 2000
+    vmid_end: 2100
+
+    vyos_template_vmid: 3011
+    vyos_cores: 1
+    vyos_memory: 1024
+
+  tasks:
+    - name: Deploy environment for each user
+      include_tasks: deploy_user.yaml
+      loop: "{{ users }}"
+      loop_control:
+        loop_var: current_user

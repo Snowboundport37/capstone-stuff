@@ -1,0 +1,17 @@
+{
+  "mode": "Remediate",
+  "outputPath": ".\\output",
+  "quarantinePath": "C:\\ProgramData\\WannaCry-Quarantine",
+  "disableSMBv1": true,
+  "blockSMBTemporarily": true,
+  "runDefenderScan": true,
+  "createRestorePointIfSupported": false,
+  "checkKillSwitch": true,
+  "skipNetworkIsolation": true,
+  "skipRegistryCleanup": false,
+  "skipServiceCleanup": false,
+  "skipFileQuarantine": false,
+  "isolateHost": false,
+  "managementAdapterAlias": "Ethernet0",
+  "reportInputPath": ""
+}

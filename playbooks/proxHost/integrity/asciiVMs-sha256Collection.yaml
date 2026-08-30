@@ -1,0 +1,136 @@
+- name: Collect SHA256 hashes of ASCII VMs from pve-node
+  hosts: remediator
+  become: yes
+  gather_facts: yes
+
+  tasks:
+
+    - name: Create output directory
+      delegate_to: localhost
+      run_once: yes
+      become: no
+      file:
+        path: "{{ playbook_dir }}/vm-hashes"
+        state: directory
+        mode: '0755'
+
+    - name: Hash all VMs with ASCII in their name
+      shell: |
+        python3 << 'EOF'
+        import json, subprocess, os, sys
+
+        # Pull full VM list from Proxmox API
+        r = subprocess.run(
+            ["pvesh", "get", "/nodes/pve-node/qemu", "--output-format", "json"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(json.dumps({"error": r.stderr.strip()}))
+            sys.exit(1)
+
+        all_vms = json.loads(r.stdout)
+        ascii_vms = [v for v in all_vms if "ASCII" in v.get("name", "")]
+
+        results = []
+        for vm in ascii_vms:
+            vmid = str(vm["vmid"])
+            name = vm.get("name", "unknown")
+            status = vm.get("status", "unknown")
+
+            # Hash the VM config file
+            conf_path = f"/etc/pve/qemu-server/{vmid}.conf"
+            try:
+                r2 = subprocess.run(["sha256sum", conf_path], capture_output=True, text=True)
+                config_hash = r2.stdout.split()[0] if r2.returncode == 0 else "unavailable"
+            except Exception:
+                config_hash = "unavailable"
+
+            # Find disk files for this VM
+            disks = []
+
+            # Directory-based storage (qcow2, raw, vmdk)
+            img_dir = f"/var/lib/vz/images/{vmid}"
+            if os.path.isdir(img_dir):
+                for fname in os.listdir(img_dir):
+                    if fname.endswith((".qcow2", ".raw", ".vmdk")):
+                        disks.append(os.path.join(img_dir, fname))
+
+            # LVM thin
+            r3 = subprocess.run(
+                ["lvs", "--noheadings", "-o", "lv_path"],
+                capture_output=True, text=True
+            )
+            for line in r3.stdout.splitlines():
+                lv = line.strip()
+                if f"vm-{vmid}-" in lv:
+                    disks.append(lv)
+
+            # ZFS
+            r4 = subprocess.run(
+                ["zfs", "list", "-H", "-o", "name"],
+                capture_output=True, text=True
+            )
+            for zname in r4.stdout.splitlines():
+                if f"vm-{vmid}-" in zname and "@" not in zname:
+                    disks.append(f"/dev/zvol/{zname.strip()}")
+
+            # Hash each disk
+            disk_hashes = []
+            for disk in disks:
+                if not os.path.exists(disk):
+                    continue
+                rh = subprocess.run(["sha256sum", disk], capture_output=True, text=True)
+                if rh.returncode == 0:
+                    disk_hashes.append({
+                        "path": disk,
+                        "hash": rh.stdout.split()[0]
+                    })
+                else:
+                    disk_hashes.append({
+                        "path": disk,
+                        "hash": "unavailable",
+                        "error": rh.stderr.strip()
+                    })
+
+            results.append({
+                "vmid": int(vmid),
+                "name": name,
+                "status": status,
+                "config_hash": config_hash,
+                "disks": disk_hashes
+            })
+
+        print(json.dumps(results))
+        EOF
+      args:
+        executable: /bin/bash
+      register: hash_raw
+      changed_when: false
+
+    - name: Parse VM hashes
+      set_fact:
+        vm_data: "{{ hash_raw.stdout | from_json }}"
+
+    - name: Save results to Ansible server
+      delegate_to: localhost
+      become: no
+      copy:
+        content: |
+          {
+            "manifest_version": "1.0",
+            "generated": "{{ ansible_date_time.iso8601 }}",
+            "node": "remediator",
+            "filter": "name contains ASCII",
+            "total_vms": {{ vm_data | length }},
+            "vms": {{ vm_data | to_nice_json }}
+          }
+        dest: "{{ playbook_dir }}/vm-hashes/ascii-vms-manifest.json"
+        mode: '0644'
+
+    - name: Show summary
+      debug:
+        msg:
+          - "Complete!"
+          - "VMs hashed: {{ vm_data | length }}"
+          - "Output: {{ playbook_dir }}/vm-hashes/ascii-vms-manifest.json"
+          - "VM names: {{ vm_data | map(attribute='name') | list }}"

@@ -1,0 +1,124 @@
+###########################################################################
+# SETUP — bridge + VMID allocation + build master lists (no cloning)
+###########################################################################
+
+###########################################################################
+# BRIDGE (combined into fewest SSH calls possible)
+###########################################################################
+
+- name: "{{ current_user.name }}: Check IP and find bridge in one call"
+  ansible.builtin.shell: |
+    existing=$(ip -4 -o addr show | awk '$4=="{{ current_user.bridge_ip }}{{ bridge_cidr }}" {print $2}')
+    if [ -n "$existing" ]; then
+      echo "$existing"
+      exit 0
+    fi
+    for i in $(seq 0 99); do
+      if ! ip link show vmbr$i >/dev/null 2>&1; then
+        echo "NEW:vmbr$i"
+        exit 0
+      fi
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  register: bridge_result
+  changed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "{{ current_user.name }}: Set bridge facts"
+  ansible.builtin.set_fact:
+    bridge_is_new: "{{ bridge_result.stdout | trim is match('NEW:.*') }}"
+    bridge_name: "{{ (bridge_result.stdout | trim | replace('NEW:', '')) }}"
+
+- name: "{{ current_user.name }}: Create and bring up bridge"
+  ansible.builtin.shell: |
+    cat >> /etc/network/interfaces <<'BLOCK'
+
+    # BEGIN ANSIBLE MANAGED {{ bridge_name }}
+    auto {{ bridge_name }}
+    iface {{ bridge_name }} inet static
+      address {{ current_user.bridge_ip }}
+      netmask {{ bridge_netmask }}
+      bridge-ports none
+      bridge-stp off
+      bridge-fd 0
+    # END ANSIBLE MANAGED {{ bridge_name }}
+    BLOCK
+    ifup {{ bridge_name }}
+  when: bridge_is_new | bool
+  delegate_to: "{{ proxmox_target_host }}"
+
+###########################################################################
+# VM EXPANSION
+###########################################################################
+
+- name: "{{ current_user.name }}: Reset user_vms"
+  ansible.builtin.set_fact:
+    user_vms: []
+
+- name: "{{ current_user.name }}: Expand VM definitions"
+  include_tasks: expand_vm.yaml
+  loop: "{{ current_user.vms }}"
+  loop_control:
+    loop_var: vm_def
+
+###########################################################################
+# VMID ALLOCATION (uses pre-fetched global_used_vmids + claimed_vmids)
+###########################################################################
+
+- name: "{{ current_user.name }}: Build free VMID list"
+  ansible.builtin.set_fact:
+    free_vmids: "{{ range(vmid_start, vmid_end + 1) | reject('in', (global_used_vmids + claimed_vmids) | map('int') | unique | list) | list }}"
+
+- name: "{{ current_user.name }}: Verify sufficient free VMIDs"
+  ansible.builtin.fail:
+    msg: "Not enough free VMIDs for {{ current_user.name }}. Need {{ user_vms | length + 1 }}, found {{ free_vmids | length }}"
+  when: free_vmids | length < user_vms | length + 1
+
+- name: "{{ current_user.name }}: Set VyOS VMID"
+  ansible.builtin.set_fact:
+    vyos_vmid: "{{ free_vmids[0] }}"
+
+- name: "{{ current_user.name }}: Build VM plan"
+  ansible.builtin.set_fact:
+    vm_plan: "{{ vm_plan | default([]) + [ item | combine({'new_vmid': free_vmids[idx + 1], 'bridge': bridge_name}) ] }}"
+  loop: "{{ user_vms }}"
+  loop_control:
+    index_var: idx
+
+###########################################################################
+# ACCUMULATE MASTER LISTS
+###########################################################################
+
+- name: "{{ current_user.name }}: Add VyOS to master clone list"
+  ansible.builtin.set_fact:
+    master_clone_list: "{{ master_clone_list + [{'src_vmid': '3008', 'new_vmid': vyos_vmid | string, 'name': 'VyOS-' + current_user.name}] }}"
+
+- name: "{{ current_user.name }}: Add VMs to master clone list"
+  ansible.builtin.set_fact:
+    master_clone_list: "{{ master_clone_list + [{'src_vmid': item.vmid | string, 'new_vmid': item.new_vmid | string, 'name': item.name}] }}"
+  loop: "{{ vm_plan }}"
+
+- name: "{{ current_user.name }}: Add VyOS config"
+  ansible.builtin.set_fact:
+    master_vyos_configs: >-
+      {{ master_vyos_configs + [{'vmid': vyos_vmid | string, 'name': 'VyOS-' + current_user.name,
+          'cores': vyos_cores, 'memory': vyos_memory,
+          'wan_bridge': wan_bridge, 'lan_bridge': bridge_name}] }}
+
+- name: "{{ current_user.name }}: Add VM configs"
+  ansible.builtin.set_fact:
+    master_vm_configs: "{{ master_vm_configs + [{'new_vmid': item.new_vmid | string, 'cores': item.cores, 'memory': item.memory, 'bridge': item.bridge}] }}"
+  loop: "{{ vm_plan }}"
+
+- name: "{{ current_user.name }}: Track VMIDs"
+  ansible.builtin.set_fact:
+    master_pool_vmids: "{{ master_pool_vmids + [vyos_vmid | string] + vm_plan | map(attribute='new_vmid') | map('string') | list }}"
+    claimed_vmids: "{{ claimed_vmids + [vyos_vmid | string] + vm_plan | map(attribute='new_vmid') | map('string') | list }}"
+
+- name: "{{ current_user.name }}: Clear per-user temps"
+  ansible.builtin.set_fact:
+    vm_plan: []
+    user_vms: []
+    vyos_vmid: ""

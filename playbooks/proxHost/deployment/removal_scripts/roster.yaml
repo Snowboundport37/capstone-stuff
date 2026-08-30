@@ -1,0 +1,3 @@
+users:
+  - name: ASCII
+    bridge_ip: "10.10.10.1"

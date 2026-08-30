@@ -1,0 +1,21 @@
+---
+  - name: Clone VMS
+    provmox_kvm:
+      api_host: localhost
+      api_user: "{{ proxmox_user }}"
+      api_password: "CHANGE_ME"
+      node: "{{ proxmox_node }}"
+      clone: "{{ templates[vm_group.template].vmid }}"
+      vmid: "{{ vmid_counter | int + vm_number | int - 1 }}"
+      name: "{{ vm_group.name_prefix }}-{{ '%02d' | format(vm_number | int) }}"
+      storage: shared-storage
+      full: no
+      state: started
+      timeout: 300
+    with_sequence: start=1 end{{ vm_group.count }}
+    loop_control:
+      loop_var: vm_number
+
+  - name: Increment counter
+    set_face:
+      vmid_counter: "{{ vmid_counter | int + vm_group.count }}"

@@ -1,0 +1,214 @@
+---
+- name: Deployment 2 - Flexible VM Deploy
+  hosts: localhost
+  gather_facts: no
+  become: true
+  vars_files:
+    - roster.yaml
+  vars:
+    template_node: pve-node
+    proxmox_target_node: pve-node
+    proxmox_target_host: remediator
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    bridge_netmask: "255.255.255.0"
+    bridge_cidr: "/24"
+    vmid_start: 2000
+    vmid_end: 2100
+    vyos_template_vmid: 3011
+    vyos_cores: 1
+    vyos_memory: 1024
+
+    ###########################################################################
+    # CLONE TUNING — maximum speed
+    ###########################################################################
+    clone_throttle: 2       # 2 clones at once (pipeline)
+    clone_retries: 4        # retries on CFS lock
+    clone_delay: 1          # 1 second between retries
+
+    pool_name: Deployment2
+
+    # Master lists (accumulated during setup)
+    master_clone_list: []
+    master_vm_configs: []
+    master_vyos_configs: []
+    master_pool_vmids: []
+    claimed_vmids: []
+    global_used_vmids: []
+
+  tasks:
+
+    #######################################################################
+    # HOST REGISTRATION
+    #######################################################################
+
+    - name: Add pve-node host
+      ansible.builtin.add_host:
+        name: pve-node
+        ansible_host: 10.10.0.1
+        ansible_port: 49152
+        ansible_user: root
+        ansible_password: "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    - name: Add remediator host
+      ansible.builtin.add_host:
+        name: remediator
+        ansible_host: 10.10.0.1
+        ansible_port: 49154
+        ansible_user: root
+        ansible_password: "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    #######################################################################
+    # POOL
+    #######################################################################
+
+    - name: Create pool if needed
+      ansible.builtin.shell: |
+        pvesh get /pools/{{ pool_name }} --noborder 1 >/dev/null 2>&1 || \
+        pvesh create /pools --poolid {{ pool_name }} --comment "Deployment 2 — all users"
+      changed_when: false
+      delegate_to: "{{ template_node }}"
+
+    #######################################################################
+    # GLOBAL VMID QUERY (once, not per user)
+    #######################################################################
+
+    - name: Get all used VMIDs (one query per node)
+      ansible.builtin.shell: |
+        qm list | awk 'NR>1 {print $1}'
+      register: vmids_on_target
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Get template node VMIDs
+      ansible.builtin.shell: |
+        qm list | awk 'NR>1 {print $1}'
+      register: vmids_on_template
+      changed_when: false
+      delegate_to: "{{ template_node }}"
+
+    - name: Build global used VMID list
+      ansible.builtin.set_fact:
+        global_used_vmids: "{{ (vmids_on_target.stdout_lines + vmids_on_template.stdout_lines) | map('int') | unique | list }}"
+
+    #######################################################################
+    # SETUP — bridges + build master lists (no SSH for VMIDs anymore)
+    #######################################################################
+
+    - name: Setup each user
+      include_tasks: setup_user.yaml
+      loop: "{{ users }}"
+      loop_control:
+        loop_var: current_user
+
+    #######################################################################
+    # PHASE 1: CLONE ALL VMS
+    #######################################################################
+
+    - name: "CLONE {{ item.name }} ({{ item.src_vmid }} -> {{ item.new_vmid }})"
+      ansible.builtin.shell: |
+        if qm status {{ item.new_vmid }} >/dev/null 2>&1; then
+          echo "SKIP: {{ item.name }} already exists"
+          exit 0
+        fi
+        qm clone "{{ item.src_vmid }}" "{{ item.new_vmid }}" \
+          --name "{{ item.name }}" \
+          --target "{{ proxmox_target_node }}" \
+          --full 0 2>&1
+      register: clone_result
+      until: >-
+        clone_result.rc == 0 or
+        'already exists' in (clone_result.stdout | default(''))
+      retries: "{{ clone_retries }}"
+      delay: "{{ clone_delay }}"
+      failed_when: >-
+        clone_result.rc != 0 and
+        'already exists' not in (clone_result.stdout | default('')) and
+        'already exists' not in (clone_result.stderr | default(''))
+      loop: "{{ master_clone_list }}"
+      throttle: "{{ clone_throttle }}"
+      delegate_to: "{{ template_node }}"
+
+    #######################################################################
+    # PHASE 2: CONFIGURE EVERYTHING (all async, fire all at once)
+    #######################################################################
+
+    - name: "Config VyOS {{ item.name }}"
+      ansible.builtin.shell: |
+        for nic in $(qm config {{ item.vmid }} | grep -oP '^net\d+'); do
+          qm set {{ item.vmid }} --delete $nic
+        done
+        qm set "{{ item.vmid }}" \
+          --cores {{ item.cores }} --memory {{ item.memory }} \
+          --net0 "virtio,bridge={{ item.wan_bridge }}" \
+          --net1 "virtio,bridge={{ item.lan_bridge }}"
+      loop: "{{ master_vyos_configs }}"
+      async: 120
+      poll: 0
+      register: vyos_jobs
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "Config VM {{ item.new_vmid }} CPU/RAM/NET"
+      ansible.builtin.shell: |
+        qm set "{{ item.new_vmid }}" \
+          --cores "{{ item.cores | int }}" \
+          --memory "{{ item.memory | int }}" \
+          --net0 "virtio,bridge={{ item.bridge }}"
+      loop: "{{ master_vm_configs }}"
+      async: 120
+      poll: 0
+      register: config_jobs
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "Fix TPM {{ item.new_vmid }}"
+      ansible.builtin.shell: |
+        if qm config {{ item.new_vmid }} | grep -q '^tpmstate0:'; then
+          qm set {{ item.new_vmid }} --tpmstate0 local-lvm:1
+        fi
+      loop: "{{ master_vm_configs }}"
+      async: 120
+      poll: 0
+      register: tpm_jobs
+      delegate_to: "{{ proxmox_target_host }}"
+
+    # Wait for all config (fast polling)
+    - name: Wait VyOS configs
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ vyos_jobs.results }}"
+      register: r
+      until: r.finished
+      retries: 30
+      delay: 2
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait VM configs
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ config_jobs.results }}"
+      register: r
+      until: r.finished
+      retries: 30
+      delay: 2
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait TPM fixes
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ tpm_jobs.results }}"
+      register: r
+      until: r.finished
+      retries: 30
+      delay: 2
+      delegate_to: "{{ proxmox_target_host }}"
+
+    #######################################################################
+    # PHASE 3: POOL (one command)
+    #######################################################################
+
+    - name: Add all VMs to pool
+      ansible.builtin.shell: |
+        pvesh set /pools/{{ pool_name }} --vms {{ master_pool_vmids | join(',') }}
+      delegate_to: "{{ template_node }}"

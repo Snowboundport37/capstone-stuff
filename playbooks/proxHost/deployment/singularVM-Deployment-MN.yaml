@@ -1,0 +1,46 @@
+- name: Clone a singular VM for redeployment on proxnode
+  hosts: pve-node
+  gather_facts: no
+
+  vars:
+    source_vmid: 1011
+    target_node: "connor2"
+    new_vm_name: "test"
+    full_clone: no
+    storage: "shared-storage"
+    start_vm: yes
+
+    vmid_range_start: 2000
+    vmid_range_end: 3000
+
+
+  tasks:
+    - name: get list of available VM id's in range.
+      shell: |
+        existing=$(pvesh get /cluster/resources --type vm --output-format json | jq -r '.[].vmid')
+        for id in $(seq {{ vmid_range_start }} {{ vmid_range_end }}); do
+          if ! echo "$existing" | grep -q "^${id}$"; then
+            echo $id
+            exit 0
+          fi
+        done
+        exit 1
+      register: available_vmid
+      failed_when: available_vmid.rc != 0
+      changed_when: false
+
+    - name: set new vm_id variable
+      set_fact:
+        new_vmid: "{{ available_vmid.stdout | trim }}"
+
+    - name: clone VM to target Node.
+      shell: >
+        qm clone {{ source_vmid }} {{ new_vmid }}
+        --name {{ new_vm_name }} --target {{ target_node }} --storage {{ storage }}
+      register: clone_result
+      changed_when: clone_result.rc == 0
+
+    - name: display clone result
+      debug:
+        msg: "VM cloned successfully. New VMID: {{ new_vmid }}, Name: {{ new_vm_name }}"
+      when: clone_result.rc == 0

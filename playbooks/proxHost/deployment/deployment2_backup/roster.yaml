@@ -1,0 +1,77 @@
+wan_bridge: ETH1
+
+templates:
+  fakenet:
+    vmid: 3000
+    cores: 1
+    memory: 2048
+  win10:
+    vmid: 3001
+    cores: 2
+    memory: 4096
+  win11:
+    vmid: 3002
+    cores: 2
+    memory: 4096
+  winsrv: 
+    vmid: 3003
+    cores: 4
+    memory: 4096
+  ubusrv:
+    vmid: 3004
+    cores: 1
+    memory: 2048
+  ubu:
+    vmid: 3005
+    cores: 1 
+    memory: 4096
+  rocky: 
+    vmid: 3006
+    cores: 1
+    memory: 2048
+  kali:
+    vmid: 3007
+    cores: 1
+    memory: 2048
+  vyos:
+    vmid: 3008
+    cores: 1
+    memory: 2048
+  pfsense:
+    vmid: 3009
+    cores: 1 
+    memory: 2048
+  vyos-gw:
+    vmid: 3010
+    cores: 1
+    memory: 2048
+  vyos-dhcp:
+    vmid: 3011
+    cores: 1
+    memory: 2048
+  zeek:
+    vmid: 3012
+    cores: 3 
+    memory: 4096
+  malware:
+    vmid: 3013
+    cores: 1
+    memory: 2048
+
+users:
+  - name: alice
+    bridge_ip: "10.10.10.1"
+    vms:
+      - template: win10
+        count: 2
+      - template: ubusrv
+      - template: rocky
+      - template: zeek
+      - template: kali
+
+  - name: bob
+    bridge_ip: "10.10.20.1"
+    vms:
+      - template: win10
+        count: 3
+      - template: ubusrv

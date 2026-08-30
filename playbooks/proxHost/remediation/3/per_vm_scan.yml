@@ -1,0 +1,343 @@
+###############################################################################
+# per_vm_scan.yml
+# Included once per VM host in parallel play.
+# Uses guest helper for robust/faster in-guest staging and execution.
+###############################################################################
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+- name: "VMID {{ current_vmid }} | Set constants"
+  ansible.builtin.set_fact:
+    guest_stage: "C:\\ProgramData\\MalwareRemediation"
+    guest_b64:   "C:\\ProgramData\\MalwareRemediation\\stage.b64"
+    guest_ps1:   "C:\\ProgramData\\MalwareRemediation\\windows-behavioral-detect.ps1"
+    chunk_size:  2200
+    vm_detection_overrides: "{{ detection_overrides_by_vmid[current_vmid | string] | default({}) }}"
+    vm_detection_score_threshold: "{{ vm_detection_overrides.detection_score_threshold | default(detection_score_threshold) }}"
+    vm_detection_min_strong_hits: "{{ vm_detection_overrides.detection_min_strong_hits | default(detection_min_strong_hits) }}"
+    vm_detection_min_categories: "{{ vm_detection_overrides.detection_min_categories | default(detection_min_categories) }}"
+    vm_detection_stager_recent_minutes: "{{ vm_detection_overrides.detection_stager_recent_minutes | default(detection_stager_recent_minutes) }}"
+    vm_detection_require_ps_stager_obfuscation: "{{ vm_detection_overrides.detection_require_ps_stager_obfuscation | default(detection_require_ps_stager_obfuscation) | bool }}"
+
+# ── Timestamps + report scaffold ──────────────────────────────────────────────
+
+- name: "VMID {{ current_vmid }} | Init report entry"
+  ansible.builtin.set_fact:
+    vm_report_entry:
+      vmid: "{{ current_vmid }}"
+      scan_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+# ── Read VM state from Proxmox ────────────────────────────────────────────────
+
+- name: "VMID {{ current_vmid }} | Read VM status"
+  ansible.builtin.command:
+    argv: [qm, status, "{{ current_vmid }}"]
+  register: vm_status
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ current_vmid }} | Read VM config"
+  ansible.builtin.command:
+    argv: [qm, config, "{{ current_vmid }}"]
+  register: vm_config
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ current_vmid }} | Parse VM config"
+  ansible.builtin.set_fact:
+    vm_name:   "{{ (vm_config.stdout | regex_search('(?m)^name:\\s*(.+)$', '\\1') | default(['vm-' ~ current_vmid], true))[0] }}"
+    vm_ostype: "{{ (vm_config.stdout | regex_search('(?m)^ostype:\\s*(.+)$', '\\1') | default([''], true))[0] }}"
+    vm_cores:  "{{ (vm_config.stdout | regex_search('(?m)^cores:\\s*(\\d+)$', '\\1') | default(['2'], true))[0] | int }}"
+    vm_memory: "{{ (vm_config.stdout | regex_search('(?m)^memory:\\s*(\\d+)$', '\\1') | default(['4096'], true))[0] | int }}"
+    vm_net0:   "{{ (vm_config.stdout | regex_search('(?m)^net0:\\s*(.+)$', '\\1') | default([''], true))[0] }}"
+
+- name: "VMID {{ current_vmid }} | Set runtime flags"
+  ansible.builtin.set_fact:
+    vm_is_running: "{{ 'running' in ((vm_status.stdout | default('')) | lower) }}"
+    vm_is_windows: >-
+      {{ ((vm_ostype | lower) is search('win')) or
+         ((vm_name   | lower) is search('win')) or
+         ((vm_name   | lower) is search('malware')) }}
+    vm_has_clean_snapshot: true
+
+- name: "VMID {{ current_vmid }} | Debug flags"
+  ansible.builtin.debug:
+    msg:
+      - "vm_name:       {{ vm_name }}"
+      - "vm_ostype:     {{ vm_ostype }}"
+      - "vm_is_running: {{ vm_is_running }}"
+      - "vm_is_windows: {{ vm_is_windows }}"
+
+# ── Skip non-Windows / stopped VMs ───────────────────────────────────────────
+
+- name: "VMID {{ current_vmid }} | Skip if not a running Windows VM"
+  when: (not vm_is_running) or (not vm_is_windows)
+  ansible.builtin.set_fact:
+    vm_report_entry: >-
+      {{
+        vm_report_entry | combine({
+          'vm_name':          vm_name,
+          'ostype':           vm_ostype,
+          'status':           'skipped',
+          'reason':           (not vm_is_running) | ternary('vm_not_running', 'not_windows_guest'),
+          'scan_finished_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')
+        }, recursive=True)
+      }}
+
+- name: "VMID {{ current_vmid }} | Read VM snapshots"
+  when: vm_is_running and vm_is_windows and (replace_infected | bool)
+  ansible.builtin.command:
+    argv: [qm, listsnapshot, "{{ current_vmid }}"]
+  register: vm_snapshots
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ current_vmid }} | Check for clean snapshot '{{ clean_snapshot }}'"
+  when: vm_is_running and vm_is_windows and (replace_infected | bool)
+  ansible.builtin.set_fact:
+    vm_has_clean_snapshot: "{{ (vm_snapshots.stdout | default('')) is search(clean_snapshot) }}"
+
+- name: "VMID {{ current_vmid }} | Skip if clean snapshot missing"
+  when: vm_is_running and vm_is_windows and (replace_infected | bool) and (not vm_has_clean_snapshot | bool)
+  ansible.builtin.set_fact:
+    vm_report_entry: >-
+      {{
+        vm_report_entry | combine({
+          'vm_name':          vm_name,
+          'ostype':           vm_ostype,
+          'status':           'skipped',
+          'reason':           'missing_clean_snapshot',
+          'clean_snapshot':   clean_snapshot,
+          'scan_finished_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')
+        }, recursive=True)
+      }}
+
+# ── Main detection + remediation block ───────────────────────────────────────
+
+- name: "VMID {{ current_vmid }} | Detect and remediate"
+  when: vm_is_running and vm_is_windows and ((not replace_infected | bool) or (vm_has_clean_snapshot | bool))
+  block:
+
+    - name: "VMID {{ current_vmid }} | Wait for QEMU guest agent"
+      ansible.builtin.command:
+        argv: [qm, agent, "{{ current_vmid }}", ping]
+      register: qga_ping
+      retries: "{{ qga_ping_retries | default(12) | int }}"
+      delay: "{{ qga_ping_delay_seconds | default(3) | int }}"
+      until: qga_ping.rc == 0
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "VMID {{ current_vmid }} | Wait for agent before helper run"
+      ansible.builtin.command:
+        argv: [qm, agent, "{{ current_vmid }}", ping]
+      register: pre_exec_ping
+      retries: "{{ qga_pre_exec_retries | default(10) | int }}"
+      delay: "{{ qga_pre_exec_delay_seconds | default(3) | int }}"
+      until: pre_exec_ping.rc == 0
+      changed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "VMID {{ current_vmid }} | Run helper to stage and execute detection"
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "{{ helper_max_runtime_seconds | default(600) | int }}s"
+          - python3
+          - /tmp/guest_stage_and_remediate.py
+      register: helper_exec
+      failed_when: false
+      async: "{{ (helper_max_runtime_seconds | default(600) | int) + 30 }}"
+      poll: "{{ helper_poll_seconds | default(5) | int }}"
+      environment:
+        VMID: "{{ current_vmid }}"
+        SCRIPT_NAME: "windows-behavioral-detect.ps1"
+        WCR_LOCAL_PS1: "/tmp/windows-behavioral-detect.ps1"
+        WCR_STAGE: "C:/ProgramData/MalwareRemediation"
+        WCR_B64: "C:/ProgramData/MalwareRemediation/stage.b64"
+        WCR_PS1: "C:/ProgramData/MalwareRemediation/windows-behavioral-detect.ps1"
+        WCR_CHUNK_SIZE: "{{ guest_chunk_size | default(8000) | string }}"
+        WCR_QM_TIMEOUT: "{{ guest_exec_timeout_seconds | default(180) | string }}"
+        WCR_CHUNK_WRITE_ATTEMPTS: "{{ guest_chunk_write_attempts | default(8) | string }}"
+        WCR_PROGRESS_FILE: "/tmp/wcr_{{ current_vmid }}.log"
+        SCRIPT_ARGS: >-
+          -LookbackHours {{ detection_lookback_hours | default(24) }}
+          -HighCpuSeconds {{ detection_high_cpu_seconds | default(3) }}
+          -HighMemoryMB {{ detection_high_memory_mb | default(500) }}
+          -PowerShellBurstThreshold {{ detection_powershell_burst_threshold | default(5) }}
+          -StagerRecentMinutes {{ vm_detection_stager_recent_minutes | default(15) }}
+          -DetectionThreshold {{ vm_detection_score_threshold | default(12) }}
+          -MinStrongHitsToConfirm {{ vm_detection_min_strong_hits | default(2) }}
+          -MinCategoriesToConfirm {{ vm_detection_min_categories | default(2) }}
+          {{ (vm_detection_require_ps_stager_obfuscation | bool) | ternary('-RequirePsStagerObfuscation', '') }}
+          {{ (detection_enable_registry_blob_scan | default(false) | bool) | ternary('-EnableRegistryBlobScan', '') }}
+      delegate_to: "{{ proxmox_target_host }}"
+      changed_when: true
+
+    - name: "VMID {{ current_vmid }} | Debug raw detection output"
+      ansible.builtin.debug:
+        msg:
+          - "helper_rc: {{ helper_exec.rc | default('?') }}"
+          - "stdout:    {{ helper_exec.stdout | default('empty') }}"
+          - "stderr:    {{ helper_exec.stderr | default('empty') }}"
+
+    - name: "VMID {{ current_vmid }} | Parse detection result"
+      ansible.builtin.set_fact:
+        raw_output: "{{ helper_exec.stdout | default('') }}"
+
+    - name: "VMID {{ current_vmid }} | Fail if helper execution failed"
+      ansible.builtin.fail:
+        msg: >-
+          Detection helper failed (rc={{ helper_exec.rc | default('?') }}).
+          stderr={{ helper_exec.stderr | default('') }}
+      when: (helper_exec.rc | int) != 0
+
+    - name: "VMID {{ current_vmid }} | Find JSON line in output"
+      ansible.builtin.set_fact:
+        detection_json_line: "{{ raw_output | trim }}"
+
+    - name: "VMID {{ current_vmid }} | Fail if detection JSON missing"
+      ansible.builtin.fail:
+        msg: >-
+          Detection script did not return JSON output.
+          Raw output: {{ raw_output | default('') }}
+      when: not (detection_json_line | regex_search('^\\{.*\\}$'))
+
+    - name: "VMID {{ current_vmid }} | Parse score and indicators"
+      ansible.builtin.set_fact:
+        detection_result:          "{{ detection_json_line | from_json }}"
+        detection_score:           "{{ (detection_json_line | from_json).score | default(0) | int }}"
+        detection_likely_infected: "{{ (detection_json_line | from_json).likely_infected | default(false) | bool }}"
+        detection_confirmed_infection: "{{ (detection_json_line | from_json).confirmed_infection | default((detection_json_line | from_json).likely_infected | default(false)) | bool }}"
+        should_redeploy: >-
+          {{
+            replace_infected | bool and
+            ((detection_json_line | from_json).confirmed_infection | default((detection_json_line | from_json).likely_infected | default(false)) | bool)
+          }}
+
+    - name: "VMID {{ current_vmid }} | Record detection into report"
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'vm_name':            vm_name,
+              'ostype':             vm_ostype,
+              'detected_at':        lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+              'detection_result':   detection_result,
+              'detection_score':    detection_score,
+              'likely_infected':    detection_likely_infected,
+              'confirmed_infection': detection_confirmed_infection,
+              'redeploy_triggered': should_redeploy,
+              'remediation_action': (
+                (should_redeploy | bool) | ternary(
+                  'rollback_to_' ~ clean_snapshot,
+                  ((detection_likely_infected | bool) | ternary('detected_no_redeploy', 'no_malware_move_on'))
+                )
+              )
+            }, recursive=True)
+          }}
+
+    - name: "VMID {{ current_vmid }} | Stop infected VM"
+      when: should_redeploy | bool
+      ansible.builtin.command:
+        argv: [qm, stop, "{{ current_vmid }}", --skiplock, "1"]
+      register: stop_result
+      failed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "VMID {{ current_vmid }} | Wait for VM to fully stop"
+      when: should_redeploy | bool
+      ansible.builtin.command:
+        argv: [qm, status, "{{ current_vmid }}"]
+      register: stop_check
+      until: "'stopped' in stop_check.stdout"
+      retries: 12
+      delay: 5
+      changed_when: false
+      failed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "VMID {{ current_vmid }} | Record rollback timestamp"
+      when: should_redeploy | bool
+      ansible.builtin.set_fact:
+        nuke_timestamp: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: "VMID {{ current_vmid }} | Enforce rollback snapshot pin"
+      when: should_redeploy | bool
+      ansible.builtin.assert:
+        that:
+          - clean_snapshot == 'pre-malware-421'
+        fail_msg: "Refusing rollback: clean_snapshot must be exactly 'pre-malware-421'."
+
+    - name: "VMID {{ current_vmid }} | Rollback to clean snapshot '{{ clean_snapshot }}'"
+      when: should_redeploy | bool
+      ansible.builtin.command:
+        argv: [qm, rollback, "{{ current_vmid }}", "{{ clean_snapshot }}"]
+      register: rollback_result
+      failed_when: rollback_result.rc != 0
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "VMID {{ current_vmid }} | Start restored VM"
+      when: should_redeploy | bool and rollback_result.rc == 0 and start_redeployed_vm | bool
+      ansible.builtin.command:
+        argv: [qm, start, "{{ current_vmid }}"]
+      register: start_result
+      failed_when: false
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: "VMID {{ current_vmid }} | Record redeploy timeline"
+      when: should_redeploy | bool
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'nuked_at':       nuke_timestamp,
+              'redeployed_at':  lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+              'clean_snapshot': clean_snapshot,
+              'redeploy_status': {
+                'stop_rc':     (stop_result.rc     | default(-1)),
+                'rollback_rc': (rollback_result.rc | default(-1)),
+                'start_rc':    (start_result.rc    | default(-1))
+              }
+            }, recursive=True)
+          }}
+
+    - name: "VMID {{ current_vmid }} | Mark final status"
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'status': (
+                (should_redeploy | bool) | ternary(
+                  'redeployed',
+                  ((detection_likely_infected | bool) | ternary('detected_no_redeploy', 'no_malware'))
+                )
+              ),
+              'scan_finished_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')
+            }, recursive=True)
+          }}
+
+  rescue:
+    - name: "VMID {{ current_vmid }} | Record failure"
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'vm_name':          vm_name | default('unknown'),
+              'status':           'failed',
+              'error':            ansible_failed_result.msg | default('unknown error'),
+              'scan_finished_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')
+            }, recursive=True)
+          }}
+
+# ── Write result to file on controller ───────────────────────────────────────
+
+- name: "VMID {{ current_vmid }} | Write result to file"
+  ansible.builtin.copy:
+    content: "{{ vm_report_entry | to_nice_json }}"
+    dest: "/tmp/vm_result_{{ current_vmid }}.json"
+    mode: '0644'
+  delegate_to: localhost

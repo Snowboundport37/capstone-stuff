@@ -1,0 +1,98 @@
+{
+  "manifest_version": "1.0",
+  "generated": "2026-03-12T17:15:00Z",
+  "node": "pve-node",
+  "total_templates": 15,
+  "templates": [
+    {
+        "config_hash": "ceb2c583e3b9a85be2e25ef5b7b3461fb40cadedbe88a701a9719df6a0bc1f2e",
+        "disks": [],
+        "name": "WindowsSRV-Base",
+        "vmid": 3003
+    },
+    {
+        "config_hash": "e18cc42ebc9e407c497efecf1949de474bd7a5c786dd7d942aef5e55504653fd",
+        "disks": [],
+        "name": "Vyos-GW",
+        "vmid": 3010
+    },
+    {
+        "config_hash": "fb2e970e8634479c70374cf90a77f79390d9978e3dfddf393e2887d3552d0180",
+        "disks": [],
+        "name": "Vyos-DHCP",
+        "vmid": 3011
+    },
+    {
+        "config_hash": "cac040f7183d43083514f72190eaa7c6dd4ba49b7561896df810346b228f9e91",
+        "disks": [],
+        "name": "KaliVM-Base",
+        "vmid": 3007
+    },
+    {
+        "config_hash": "d65f7f132520265b466bab5f11c4413b78c3a851feddda192224c4108b519881",
+        "disks": [],
+        "name": "Windows11-Base",
+        "vmid": 3002
+    },
+    {
+        "config_hash": "c13f0375551e6f3487db35bb027f40cd06eee50f2996a384a4c23db2239db2d2",
+        "disks": [],
+        "name": "Windows11",
+        "vmid": 105
+    },
+    {
+        "config_hash": "d071f811e9bae18a5968173df2c4b49481e9bfb8d1204f07104a92aca6d92da7",
+        "disks": [],
+        "name": "Vyos-Base",
+        "vmid": 3008
+    },
+    {
+        "config_hash": "d40f80a22f049c31745d5bee26f34f0b41b1c753d838a0f5e7e502ce06e0f674",
+        "disks": [],
+        "name": "PFSense-Base",
+        "vmid": 3009
+    },
+    {
+        "config_hash": "8d23acf9a115e2e5bb104ae87dbdbe750c4e6b2b1553a31d5e10fa1dd51e10a9",
+        "disks": [],
+        "name": "zeek-template",
+        "vmid": 3012
+    },
+    {
+        "config_hash": "37e772e2377940e36846822f71fafb10621ea1fff2e7544bc918c4531b2d371f",
+        "disks": [],
+        "name": "MalwareHost-Base",
+        "vmid": 3013
+    },
+    {
+        "config_hash": "23c86986f706953fc7ec11f0feaa3cd33f4b83f7c73e2d0f1a6e2a94f341464c",
+        "disks": [],
+        "name": "UbuntuVM-Base",
+        "vmid": 3005
+    },
+    {
+        "config_hash": "61842a71aa16f5f2c814b8d263b390ad0ed2eb18276e32d9d19b1dd1a5e01005",
+        "disks": [],
+        "name": "FakeNet-Base",
+        "vmid": 3000
+    },
+    {
+        "config_hash": "f750d697cda3203750e065835025463262a0340b513991f04db908acb6533dda",
+        "disks": [],
+        "name": "Windows10-Base",
+        "vmid": 3001
+    },
+    {
+        "config_hash": "17b8b829fe3e4853a1653b4d6a570c443cc2a408d427ae800c1d47424d3150a8",
+        "disks": [],
+        "name": "RockyVM-Base",
+        "vmid": 3006
+    },
+    {
+        "config_hash": "fb191102b15f0d390ff3c692bf6e9087ed9be00e1dede956d0c56293621214f3",
+        "disks": [],
+        "name": "UbuntuSRV-Base",
+        "vmid": 3004
+    }
+]
+}

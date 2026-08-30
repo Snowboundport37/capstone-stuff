@@ -1,0 +1,84 @@
+{
+  "manifest_version": "1.0",
+  "generated": "2026-03-30T14:43:10Z",
+  "node": "remediator",
+  "filter": "name contains ASCII",
+  "total_vms": 10,
+  "vms": [
+    {
+        "config_hash": "3b0b93fce080039d44ced8433c31565ec2f364b4d9936eea1cf331bdd969dd9c",
+        "disks": [],
+        "name": "rocky-2-ASCII",
+        "status": "stopped",
+        "vmid": 2010
+    },
+    {
+        "config_hash": "dcc40421b49004006067c9ca4283a355ba16f97e73a785215895de417e524e71",
+        "disks": [],
+        "name": "kali-2-ASCII",
+        "status": "stopped",
+        "vmid": 2012
+    },
+    {
+        "config_hash": "7a88adb45559c307997f76c28aa30cdacec7a993b79df47cbd871e5bf89f681d",
+        "disks": [],
+        "name": "kali-1-ASCII",
+        "status": "stopped",
+        "vmid": 2011
+    },
+    {
+        "config_hash": "2e37267c7a6308aeb92346aaae8f5df95bab32eabe45ade2d72a2836788d4d37",
+        "disks": [],
+        "name": "VyOS-ASCII",
+        "status": "stopped",
+        "vmid": 2003
+    },
+    {
+        "config_hash": "855c433ded5ea3fe991140e885fbdac40cb9b0a8fef7b4240a07aa88947bf811",
+        "disks": [],
+        "name": "ubusrv-3-ASCII",
+        "status": "stopped",
+        "vmid": 2008
+    },
+    {
+        "config_hash": "4fe96aeb751051ac902b7588f20b5a4699c012e35dc091e7d3132eadee8d763d",
+        "disks": [],
+        "name": "windows2-ASCII",
+        "status": "stopped",
+        "vmid": 2005
+    },
+    {
+        "config_hash": "3f0c6f99135ac9d7b2f8f31ec7ec5ea4e24b12402b0317424a69e7fd8f2019fa",
+        "disks": [],
+        "name": "ubusrv-2-ASCII",
+        "status": "stopped",
+        "vmid": 2007
+    },
+    {
+        "config_hash": "33a73a6437cfa4ba7d3d77c5f7aba94dd104151163f7da1df0dc92dd5b147d2d",
+        "disks": [],
+        "name": "ubusrv-1-ASCII",
+        "status": "stopped",
+        "vmid": 2006
+    },
+    {
+        "config_hash": "d48b969a738a0f2e1e9f5ab0966b470cf8f99c68a2d752d1966d925ff170f616",
+        "disks": [
+            {
+                "hash": "fed344ec11c67a99338f73822f088d3917a3ed4a3e9be9d1ae20a9b15be40b57",
+                "path": "/dev/pve/vm-2004-disk-0"
+            }
+        ],
+        "name": "Windows-ASCII",
+        "status": "running",
+        "vmid": 2004
+    },
+    {
+        "config_hash": "68e849d95d83106535ad51a3451d34455cd3b5ac40d6c1be7f4fabf94d0e53cd",
+        "disks": [],
+        "name": "rocky-1-ASCII",
+        "status": "stopped",
+        "vmid": 2009
+    }
+]
+}

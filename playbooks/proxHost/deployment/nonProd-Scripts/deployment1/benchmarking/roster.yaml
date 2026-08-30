@@ -1,0 +1,67 @@
+---
+  templates:
+    win10:
+      vmid: 3001
+      name: "Windows 10"
+      cores: 2
+      mwmoet: 4096
+
+    win11:
+      vmid: 3002
+      name: "Windows 11"
+      cores: 2
+      memory: 4096
+
+    winsrv:
+      vmid: 3003
+      name: "Windows Server"
+      cores: 4
+      memory: 4096
+
+    ubuntu_srv:
+      vmid: 3004
+      name: "Ubuntu Server"
+      cores: 1
+      memory: 2048
+
+    ubuntu_desktop:
+      vmid: 3005
+      name: "Ubuntu Desktop"
+      cores: 1
+      memory: 4096
+
+    rocky:
+      vmid: 3006
+      name: "Rocky Linux"
+      cores: 1
+      memory: 2048
+
+    kali:
+      vmid: 3007
+      name: "Kali Linux"
+      cores: 1
+      memory: 2048
+
+    vyos:
+      vmid: 3008
+      name: "VyOS"
+      cores: 1
+      memory: 2048
+
+    pfsense:
+      vmid: 3009
+      name: "pfSense"
+      cores: 1
+      memory: 2048
+
+    vyos_gw:
+      vmid: 3010
+      name: "VyOS Gateway"
+      cores: 1
+      memory: 2048
+
+    vyos_dhcp:
+      vmid: 3011
+      name: "VyOS DHCP"
+      cores: 1
+      memory: 2048

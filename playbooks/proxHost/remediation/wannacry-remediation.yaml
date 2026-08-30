@@ -1,0 +1,201 @@
+---
+# Runs on the Proxmox node (must have `qm`). Override with -e remediator_host=myhost
+- name: WannaCry Remediation
+  hosts: "{{ remediator_host | default('remediator') }}"
+  become: yes
+  gather_facts: yes
+
+  vars:
+    target_vmid: 2004
+    require_visual_confirm: false
+    execute_sample: false
+    sample_path: 'C:/Users/admin/Downloads/Wannacry/b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe'
+    sample_settle_seconds: 20
+    fail_on_remediation_success_false: true
+
+    guest_ps: 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+    guest_stage_dir: 'C:/ProgramData/WannaCryRemediation'
+    guest_ps1: 'C:/ProgramData/WannaCryRemediation/wannacry-remediate.ps1'
+    guest_b64: 'C:/ProgramData/WannaCryRemediation/stage.b64'
+    guest_run_log: 'C:\ProgramData\WannaCryRemediation\wcr-run.log'
+
+    helper_dir: '/tmp/wcr-remediation'
+    host_progress_log: '/tmp/wcr-remediation/progress.log'
+
+    guest_exec_timeout_seconds: 240
+    guest_chunk_size: 2200
+    guest_chunk_write_attempts: 8
+    guest_chunk_size_retry: 1400
+    guest_chunk_write_attempts_retry: 12
+
+  tasks:
+    - name: Show run configuration
+      ansible.builtin.debug:
+        msg:
+          - "Target VMID={{ target_vmid }}"
+          - "Use -vvv for detailed live task logs"
+
+    - name: Wait for QEMU guest agent ping
+      ansible.builtin.command:
+        argv:
+          - qm
+          - agent
+          - "{{ target_vmid }}"
+          - ping
+      register: qga_ping
+      retries: 24
+      delay: 5
+      until: qga_ping.rc == 0
+      changed_when: false
+
+    - name: Ensure this run uses remediator host alias
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname == 'remediator'
+        fail_msg: "This play must run on remediator_host=remediator for VM 2004."
+
+    - name: Show target VM config from Proxmox
+      ansible.builtin.command:
+        argv:
+          - qm
+          - config
+          - "{{ target_vmid }}"
+      register: vm_config
+      changed_when: false
+
+    - name: Check VM status is running
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ target_vmid }}"
+      register: qm_status
+      changed_when: false
+
+    - name: Stop when VM is not running
+      ansible.builtin.assert:
+        that:
+          - "'running' in (qm_status.stdout | lower)"
+        fail_msg: "VM {{ target_vmid }} is not running on {{ inventory_hostname }}."
+
+    - name: Print target VM identity clues
+      ansible.builtin.debug:
+        msg:
+          - "remediator_host={{ inventory_hostname }}"
+          - "target_vmid={{ target_vmid }}"
+          - "vm_config_lines={{ vm_config.stdout_lines | default([]) }}"
+
+    - name: Reset helper working directory
+      ansible.builtin.file:
+        path: "{{ helper_dir }}"
+        state: absent
+
+    - name: Create helper working directory
+      ansible.builtin.file:
+        path: "{{ helper_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Copy remediation assets to host helper directory
+      ansible.builtin.copy:
+        src: "files/{{ item.src }}"
+        dest: "{{ helper_dir }}/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: 'wannacry-remediate.ps1', dest: 'wannacry-remediate.ps1', mode: '0600' }
+        - { src: 'guest_stage_and_remediate.py', dest: 'guest_stage_and_remediate.py', mode: '0755' }
+        - { src: 'guest_run_sample.py', dest: 'guest_run_sample.py', mode: '0755' }
+
+    - name: Optionally execute sample before remediation
+      when: execute_sample | bool
+      environment:
+        WCR_VMID: "{{ target_vmid }}"
+        WCR_PS: "{{ guest_ps }}"
+        WCR_SAMPLE: "{{ sample_path }}"
+        WCR_SETTLE: "{{ sample_settle_seconds }}"
+      ansible.builtin.command: "python3 {{ helper_dir }}/guest_run_sample.py"
+      register: sample_exec_result
+      changed_when: "'success' in sample_exec_result.stdout"
+      failed_when: false
+
+    - name: Run remediation helper
+      environment:
+        WCR_VMID: "{{ target_vmid }}"
+        WCR_PS: "{{ guest_ps }}"
+        WCR_STAGE: "{{ guest_stage_dir }}"
+        WCR_B64: "{{ guest_b64 }}"
+        WCR_PS1: "{{ guest_ps1 }}"
+        WCR_LOCAL_PS1: "{{ helper_dir }}/wannacry-remediate.ps1"
+        WCR_QM_TIMEOUT: "{{ guest_exec_timeout_seconds }}"
+        WCR_PROGRESS_FILE: "{{ host_progress_log }}"
+        WCR_CHUNK_SIZE: "{{ guest_chunk_size }}"
+        WCR_CHUNK_WRITE_ATTEMPTS: "{{ guest_chunk_write_attempts }}"
+      ansible.builtin.command: "python3 {{ helper_dir }}/guest_stage_and_remediate.py"
+      register: remediation_run
+      failed_when: false    # always continue so we can read the guest log below
+
+    - name: Read guest run log via QEMU guest agent
+      ansible.builtin.command:
+        argv:
+          - qm
+          - guest
+          - exec
+          - "{{ target_vmid }}"
+          - --
+          - cmd.exe
+          - /c
+          - "type {{ guest_run_log }}"
+      register: guest_run_log_out
+      changed_when: false
+      failed_when: false
+
+    - name: Print guest run log
+      ansible.builtin.debug:
+        msg: "{{ guest_run_log_out.stdout_lines | default(['(no log captured)']) }}"
+
+    - name: Show host progress log
+      ansible.builtin.command:
+        argv:
+          - cat
+          - "{{ host_progress_log }}"
+      register: helper_progress
+      changed_when: false
+      failed_when: false
+
+    - name: Print progress lines
+      ansible.builtin.debug:
+        msg: "{{ helper_progress.stdout_lines | default([]) }}"
+
+    - name: Print remediation stdout summary
+      ansible.builtin.debug:
+        msg:
+          - "vmid={{ target_vmid }}"
+          - "helper_rc={{ remediation_run.rc }}"
+          - "stdout={{ remediation_run.stdout_lines | default([]) }}"
+
+    - name: Print deletion and failure summary
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            remediation_run.stdout_lines
+            | default([])
+            | select('match', '^(DELETED|FAILED TO DELETE|SUMMARY|Killed|Removed):.*')
+            | list
+          }}
+
+    - name: Verify cleanup completed successfully
+      ansible.builtin.assert:
+        that:
+          - remediation_run.rc == 0
+          - "'Cleanup finished' in (remediation_run.stdout | default(''))"
+        fail_msg: >
+          Remediation did not complete successfully.
+          rc={{ remediation_run.rc }}
+          Last stdout step: {{ remediation_run.stdout_lines | default([]) | last | default('none') }}
+          Check 'Print guest run log' task output above for the full per-step trace.
+
+    - name: Clean helper working directory
+      ansible.builtin.file:
+        path: "{{ helper_dir }}"
+        state: absent
+

@@ -1,0 +1,68 @@
+- name: Set pool name
+  ansible.builtin.set_fact:
+    pool_name: "Deployment2_{{ current_user.name }}"
+
+- name: Check if pool exists
+  ansible.builtin.shell: |
+    pvesh get /pools/{{ pool_name }} --output-format json
+  register: pool_check
+  failed_when: false
+  changed_when: false
+  delegate_to: "{{ template_node }}"
+
+- name: Parse pool members and extract VMIDs
+  ansible.builtin.set_fact:
+    vm_list: "{{ (pool_check.stdout | from_json).members | selectattr('type', 'equalto', 'qemu') | map(attribute='vmid') | list }}"
+  when: pool_check.rc == 0
+
+- name: Show VMs found
+  ansible.builtin.debug:
+    msg: "User {{ current_user.name }}: Found {{ vm_list | default([]) | length }} VMs: {{ vm_list | default([]) }}"
+  when: pool_check.rc == 0
+
+- name: Stop VMs for user
+  ansible.builtin.shell: |
+    qm stop {{ item }} || true
+  loop: "{{ vm_list | default([]) }}"
+  when: 
+    - pool_check.rc == 0
+    - vm_list is defined
+    - vm_list | length > 0
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Wait for VMs to stop
+  ansible.builtin.pause:
+    seconds: 5
+  when: 
+    - pool_check.rc == 0
+    - vm_list is defined
+    - vm_list | length > 0
+
+- name: Destroy VMs for user
+  ansible.builtin.shell: |
+    qm destroy {{ item }} --purge 1
+  loop: "{{ vm_list | default([]) }}"
+  when: 
+    - pool_check.rc == 0
+    - vm_list is defined
+    - vm_list | length > 0
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Wait for VM destruction to complete
+  ansible.builtin.pause:
+    seconds: 5
+  when: 
+    - pool_check.rc == 0
+    - vm_list is defined
+    - vm_list | length > 0
+
+- name: Delete pool for user
+  ansible.builtin.shell: |
+    pvesh delete /pools/{{ pool_name }}
+  when: pool_check.rc == 0
+  delegate_to: "{{ template_node }}"
+
+- name: Summary for user
+  ansible.builtin.debug:
+    msg: "User {{ current_user.name }}: Deleted {{ vm_list | default([]) | length }} VMs and pool {{ pool_name }}"
+  when: pool_check.rc == 0

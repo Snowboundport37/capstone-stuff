@@ -1,0 +1,92 @@
+---
+- name: Remove Deployment2 Pool and All VMs
+  hosts: localhost
+  gather_facts: no
+  become: true
+
+  vars:
+    template_node: pve-node
+    proxmox_target_host: remediator
+    pool_name: Deployment1R-ASCII
+
+  tasks:
+    - name: Add pve-node host for delegation
+      ansible.builtin.add_host:
+        name: pve-node
+        ansible_host: 10.10.0.1
+        ansible_port: 49152
+        ansible_user: root
+        ansible_password: "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    - name: Add remediator host for delegation
+      ansible.builtin.add_host:
+        name: remediator
+        ansible_host: 10.10.0.1
+        ansible_port: 49154
+        ansible_user: root
+        ansible_password: "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    - name: Check if pool exists
+      ansible.builtin.shell: |
+        pvesh get /pools/{{ pool_name }} --output-format json
+      register: pool_check
+      failed_when: false
+      changed_when: false
+      delegate_to: "{{ template_node }}"
+
+    - name: Parse pool members and extract VMIDs
+      ansible.builtin.set_fact:
+        vm_list: "{{ (pool_check.stdout | from_json).members | selectattr('type', 'equalto', 'qemu') | map(attribute='vmid') | list }}"
+      when: pool_check.rc == 0
+
+    - name: Show VMs found
+      ansible.builtin.debug:
+        msg: "Pool {{ pool_name }}: Found {{ vm_list | default([]) | length }} VMs: {{ vm_list | default([]) }}"
+
+    - name: Stop all VMs
+      ansible.builtin.shell: |
+        qm stop {{ item }} || true
+      loop: "{{ vm_list | default([]) }}"
+      when:
+        - pool_check.rc == 0
+        - vm_list is defined
+        - vm_list | length > 0
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait for VMs to stop
+      ansible.builtin.pause:
+        seconds: 5
+      when:
+        - pool_check.rc == 0
+        - vm_list is defined
+        - vm_list | length > 0
+
+    - name: Destroy all VMs
+      ansible.builtin.shell: |
+        qm destroy {{ item }} --purge 1
+      loop: "{{ vm_list | default([]) }}"
+      when:
+        - pool_check.rc == 0
+        - vm_list is defined
+        - vm_list | length > 0
+      delegate_to: "{{ proxmox_target_host }}"
+
+    - name: Wait for VM destruction
+      ansible.builtin.pause:
+        seconds: 5
+      when:
+        - pool_check.rc == 0
+        - vm_list is defined
+        - vm_list | length > 0
+
+    - name: Delete pool
+      ansible.builtin.shell: |
+        pvesh delete /pools/{{ pool_name }}
+      when: pool_check.rc == 0
+      delegate_to: "{{ template_node }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "Deleted {{ vm_list | default([]) | length }} VMs and pool {{ pool_name }}"

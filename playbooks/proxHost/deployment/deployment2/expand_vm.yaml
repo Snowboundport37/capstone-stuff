@@ -1,0 +1,17 @@
+---
+- name: Append instance {{ instance_idx + 1 }} of {{ vm_def.template }} for {{ current_user.name }}
+  ansible.builtin.set_fact:
+    user_vms: >-
+      {{
+        user_vms + [{
+          'name': vm_def.template
+                  + (('-' + (instance_idx + 1) | string) if vm_def.count | default(1) | int > 1 else '')
+                  + '-' + current_user.name,
+          'vmid':         templates[vm_def.template].vmid,
+          'cores':        templates[vm_def.template].cores,
+          'memory':       templates[vm_def.template].memory
+        }]
+      }}
+  loop: "{{ range(0, vm_def.count | default(1) | int) | list }}"
+  loop_control:
+    loop_var: instance_idx

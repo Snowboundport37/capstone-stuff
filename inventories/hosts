@@ -1,0 +1,12 @@
+localhost ansible_connection=local
+
+
+[ProxmoxServers]
+pve-node ansible_host=10.10.0.1 ansible_port=49152
+pve-node-2 ansible_host=10.10.0.1 ansible_port=49153
+remediator ansible_host=10.10.0.1 ansible_port=49154
+
+[ProxmoxServers:vars]
+ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+ansible_user=root
+ansible_password=CHANGE_ME

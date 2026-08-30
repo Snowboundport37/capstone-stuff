@@ -1,0 +1,365 @@
+# ── Step 1: Enable agent and reset/start VM ──────────────────────────────
+# All shell tasks delegate to the Proxmox host because the main play runs
+# on localhost. set_fact/debug/pause tasks run locally — that is fine.
+#
+# qm reset is used instead of qm reboot because:
+#   - qm set --agent enabled=1 tells Proxmox to use the agent for power ops
+#   - qm reboot then tries to call the agent (which isn't running yet) and
+#     times out with "QEMU Guest Agent is not running"
+#   - qm reset sends a hard CPU reset signal (no agent or ACPI needed),
+#     equivalent to pressing the physical reset button on the machine
+
+- name: "VMID {{ vm.vmid }} | Enable QEMU guest agent in config"
+  ansible.builtin.shell: qm set {{ vm.vmid }} --agent enabled=1
+  changed_when: true
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ vm.vmid }} | Check current status"
+  ansible.builtin.shell: qm status {{ vm.vmid }}
+  register: vm_status
+  changed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ vm.vmid }} | Hard-reset running VM to activate virtio agent channel"
+  ansible.builtin.shell: qm reset {{ vm.vmid }}
+  when: "'running' in vm_status.stdout"
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ vm.vmid }} | Start VM if stopped"
+  ansible.builtin.shell: qm start {{ vm.vmid }}
+  when: "'running' not in vm_status.stdout"
+  delegate_to: "{{ proxmox_target_host }}"
+
+# ── Step 2: Wait for guest agent ─────────────────────────────────────────
+
+- name: "VMID {{ vm.vmid }} | Wait for guest agent"
+  ansible.builtin.shell: qm agent {{ vm.vmid }} ping
+  register: agent_ping
+  until: agent_ping.rc == 0
+  retries: "{{ (agent_timeout | int) // (agent_poll_interval | int) }}"
+  delay: "{{ agent_poll_interval }}"
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ vm.vmid }} | Set agent availability"
+  ansible.builtin.set_fact:
+    agent_available: "{{ agent_ping.rc == 0 }}"
+
+- name: "VMID {{ vm.vmid }} | Warn if agent unavailable"
+  ansible.builtin.debug:
+    msg: "WARNING: Guest agent not responding on VM {{ vm.vmid }} — skipping"
+  when: not (agent_available | bool)
+
+# ── Step 3: Get OS info ──────────────────────────────────────────────────
+
+- name: "VMID {{ vm.vmid }} | Get OS info"
+  ansible.builtin.shell: qm agent {{ vm.vmid }} get-osinfo
+  register: osinfo_raw
+  changed_when: false
+  failed_when: false
+  when: agent_available | bool
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ vm.vmid }} | Debug OS info"
+  ansible.builtin.debug:
+    msg: "OS info raw: {{ osinfo_raw.stdout | default('empty') }}"
+  when: agent_available | bool
+
+- name: "VMID {{ vm.vmid }} | Parse OS info"
+  ansible.builtin.set_fact:
+    os_info: >-
+      {{ (osinfo_raw.stdout | default('{}') | from_json).get(
+           'result',
+           osinfo_raw.stdout | default('{}') | from_json
+         ) }}
+  when: agent_available | bool
+  failed_when: false
+
+- name: "VMID {{ vm.vmid }} | Determine OS type"
+  ansible.builtin.set_fact:
+    os_id:   "{{ os_info.get('id', '')           | default('') | lower }}"
+    os_name: "{{ (os_info.get('pretty-name', '') or os_info.get('name', '') or os_info.get('id', '') or 'unknown') | lower }}"
+  when: agent_available | bool
+
+- name: "VMID {{ vm.vmid }} | Show detected OS"
+  ansible.builtin.debug:
+    msg: "Detected OS: {{ os_name }} (id: {{ os_id }})"
+  when: agent_available | bool
+
+# ── Step 4: Get network interfaces and match MAC ─────────────────────────
+
+- name: "VMID {{ vm.vmid }} | Get guest network interfaces"
+  ansible.builtin.shell: qm agent {{ vm.vmid }} network-get-interfaces
+  register: netifaces_raw
+  changed_when: false
+  failed_when: false
+  when: agent_available | bool
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ vm.vmid }} | Debug network interfaces"
+  ansible.builtin.debug:
+    msg: "Network interfaces raw: {{ netifaces_raw.stdout | default('empty') }}"
+  when: agent_available | bool
+
+- name: "VMID {{ vm.vmid }} | Parse network interfaces"
+  ansible.builtin.set_fact:
+    iface_list: >-
+      {{ (netifaces_raw.stdout | default('[]') | from_json)
+         if (netifaces_raw.stdout | default('') | from_json) is iterable
+            and (netifaces_raw.stdout | default('{}') | from_json) is not mapping
+         else (netifaces_raw.stdout | default('{}') | from_json).get('result', []) }}
+  when: agent_available | bool
+  failed_when: false
+
+- name: "VMID {{ vm.vmid }} | Debug parsed interface list"
+  ansible.builtin.debug:
+    msg: "Parsed {{ iface_list | length }} interfaces: {{ iface_list | map(attribute='name') | list }}"
+  when: agent_available | bool
+
+- name: "VMID {{ vm.vmid }} | Match interface by MAC {{ vm.mac }}"
+  ansible.builtin.set_fact:
+    guest_iface: >-
+      {{ iface_list
+         | selectattr('hardware-address', 'defined')
+         | selectattr('hardware-address', 'match', '(?i)' + vm.mac)
+         | map(attribute='name')
+         | first | default('') }}
+  when: agent_available | bool
+
+- name: "VMID {{ vm.vmid }} | Show matched interface"
+  ansible.builtin.debug:
+    msg: "Matched interface: '{{ guest_iface }}' for MAC {{ vm.mac }}"
+  when: agent_available | bool
+
+- name: "VMID {{ vm.vmid }} | Warn if no interface matched"
+  ansible.builtin.debug:
+    msg: "WARNING: No interface matched MAC {{ vm.mac }} on VM {{ vm.vmid }} — skipping IP assignment"
+  when: agent_available | bool and (guest_iface | length == 0)
+
+# ── Step 5: Assign IP based on OS type ───────────────────────────────────
+#
+# gateway and dns_servers come from the vm object (vm.gateway,
+# vm.dns_servers) rather than play-level vars, so each VM gets the
+# correct values for its user's subnet.
+#
+# VyOS: vm.gateway = "" and vm.dns_servers = [] — these env vars are
+#       exported but not used by the VyOS configure path.
+
+- name: "VMID {{ vm.vmid }} | Assign {{ vm.assigned_ip }}/{{ vm.assigned_prefix }} via guest agent"
+  when: agent_available | bool and (guest_iface | length > 0)
+  ansible.builtin.shell: |
+    {% raw %}python3 << 'PYEOF'
+    import json, os, subprocess, sys, time
+
+    VMID      = os.environ['VMID']
+    IP        = os.environ['IP']
+    PREFIX    = int(os.environ['PREFIX'])
+    GATEWAY   = os.environ['GATEWAY']
+    DNS       = os.environ['DNS'].split() if os.environ['DNS'].strip() else []
+    IFACE     = os.environ['GUEST_IFACE']
+    OS_NAME   = os.environ['OS_NAME']
+    OS_ID     = os.environ['OS_ID']
+
+    NODE = subprocess.run(
+        ["hostname"], capture_output=True, text=True
+    ).stdout.strip()
+
+    print(f"Node: {NODE}, VMID: {VMID}, Iface: {IFACE}, OS: {OS_NAME}")
+
+    # ── Helper: run a shell script inside the guest via stdin ────────────
+    def guest_exec(script, shell="/bin/sh", timeout=30):
+        """Execute a script inside the guest. Script is sent via stdin."""
+        print(f"  guest_exec [{shell}]: {script[:120]}...")
+        r = subprocess.run(
+            ["pvesh", "create",
+             f"/nodes/{NODE}/qemu/{VMID}/agent/exec",
+             "--command", shell,
+             "--input-data", script,
+             "--output-format", "json"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(f"  [FAILED rc={r.returncode}]: {r.stderr.strip()}")
+            return ""
+        try:
+            pid = json.loads(r.stdout)['pid']
+        except Exception as e:
+            print(f"  [parse error]: stdout={r.stdout!r} err={e}")
+            return ""
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            s = subprocess.run(
+                ["pvesh", "get",
+                 f"/nodes/{NODE}/qemu/{VMID}/agent/exec-status",
+                 "--pid", str(pid),
+                 "--output-format", "json"],
+                capture_output=True, text=True
+            )
+            try:
+                d = json.loads(s.stdout)
+                if d.get('exited'):
+                    err      = d.get('err-data', '').strip()
+                    out      = d.get('out-data', '').strip()
+                    exitcode = d.get('exitcode', -1)
+                    if err:      print(f"  [guest stderr]: {err}")
+                    if exitcode != 0: print(f"  [guest exitcode]: {exitcode}")
+                    if out:      print(f"  [guest stdout]: {out}")
+                    return out
+            except Exception:
+                pass
+            time.sleep(1)
+        print(f"  [TIMEOUT after {timeout}s]")
+        return ""
+
+    def guest_exec_win(script, timeout=30):
+        """Execute a cmd.exe script inside a Windows guest via stdin."""
+        return guest_exec(script + "\r\nexit\r\n", shell="cmd.exe", timeout=timeout)
+
+    dns_str = " ".join(DNS)
+
+    # ── Windows (all editions incl. Home) ───────────────────────────────
+    if "windows" in OS_NAME or "windows" in OS_ID:
+        print("Method: Windows netsh (cmd.exe)")
+        mask_int = (0xFFFFFFFF << (32 - PREFIX)) & 0xFFFFFFFF
+        mask = ".".join(
+            str((mask_int >> (8 * i)) & 0xFF) for i in reversed(range(4))
+        )
+        guest_exec_win(
+            f'netsh interface ip set address name="{IFACE}" static {IP} {mask} {GATEWAY}')
+        guest_exec_win(
+            f'netsh interface ip set dns name="{IFACE}" static {DNS[0]}')
+        for i, ds in enumerate(DNS[1:], start=2):
+            guest_exec_win(
+                f'netsh interface ip add dns name="{IFACE}" {ds} index={i}')
+
+    # ── VyOS (rolling 2025+) ───────────────────────────────────────────
+    elif "vyos" in OS_NAME or "vyos" in OS_ID:
+        print("Method: VyOS configure/set/commit")
+
+        # The QEMU agent comes up early in boot but VyOS's configure framework
+        # (script-template, vyattacfg) needs more time to initialise.
+        # Poll until the framework file is present before attempting configure.
+        print("  Waiting for VyOS configure framework to be ready...")
+        for fw_attempt in range(12):
+            fw_check = guest_exec(
+                "test -f /opt/vyatta/etc/functions/script-template && echo READY || echo NOT_READY\n",
+                timeout=15
+            )
+            if "READY" in fw_check and "NOT_READY" not in fw_check:
+                print(f"  VyOS configure framework ready (attempt {fw_attempt + 1})")
+                break
+            print(f"  Not ready yet (attempt {fw_attempt + 1}/12), waiting 15s...")
+            time.sleep(15)
+
+        vyos_script = "\n".join([
+            "#!/bin/vbash",
+            "source /opt/vyatta/etc/functions/script-template",
+            # Detect WAN interface: any ethX that is NOT the LAN interface
+            f"WAN_IFACE=$(ls /sys/class/net/ | grep -E '^eth[0-9]+$' | grep -v '^{IFACE}$' | sort | head -1)",
+            "WAN_MAC=$(cat /sys/class/net/$WAN_IFACE/address 2>/dev/null)",
+            "configure",
+            # LAN interface — static IP (this is the user's gateway)
+            f"delete interfaces ethernet {IFACE} address",
+            f"set interfaces ethernet {IFACE} address {IP}/{PREFIX}",
+            # WAN interface — hw-id binds VyOS to the correct physical NIC on
+            # fresh clones, then DHCP (no preceding delete to avoid corrupt node)
+            "set interfaces ethernet $WAN_IFACE hw-id $WAN_MAC",
+            "set interfaces ethernet $WAN_IFACE address dhcp",
+            # DNS forwarding — listen on LAN, resolve via WAN DHCP
+            f"set service dns forwarding listen-address {IP}",
+            f"set service dns forwarding allow-from {IP.rsplit('.', 1)[0]}.0/24",
+            "set service dns forwarding dhcp $WAN_IFACE",
+            # NAT masquerade — LAN clients reach WAN through VyOS
+            "set nat source rule 100 outbound-interface name $WAN_IFACE",
+            f"set nat source rule 100 source address {IP.rsplit('.', 1)[0]}.0/24",
+            "set nat source rule 100 translation address masquerade",
+            "commit",
+            "save",
+            "exit",
+        ]) + "\n"
+        guest_exec(vyos_script, shell="/bin/vbash", timeout=90)
+
+    # ── RHEL / Rocky / Alma / CentOS ────────────────────────────────────
+    elif any(x in OS_NAME or x in OS_ID
+             for x in ("rhel", "centos", "rocky", "alma", "fedora")):
+        print("Method: RHEL nmcli")
+        con = "lan-static"
+        nmcli_script = (
+            f"nmcli con delete '{con}' 2>/dev/null || true\n"
+            f"nmcli con add type ethernet con-name '{con}' ifname {IFACE}"
+            f" ip4 {IP}/{PREFIX} gw4 {GATEWAY}\n"
+            f"nmcli con mod '{con}' ipv4.dns '{dns_str}'\n"
+            f"nmcli con mod '{con}' ipv4.method manual\n"
+            f"nmcli con up '{con}'\n"
+        )
+        guest_exec(nmcli_script)
+
+    # ── Debian / Ubuntu ─────────────────────────────────────────────────
+    else:
+        netplan_check = guest_exec(
+            "ls /etc/netplan/*.yaml 2>/dev/null | head -1"
+        ).strip()
+
+        if netplan_check:
+            print("Method: Debian/Ubuntu netplan")
+            import base64
+            cfg = (
+                "network:\n"
+                "  version: 2\n"
+                "  ethernets:\n"
+                f"    {IFACE}:\n"
+                "      dhcp4: false\n"
+                f"      addresses: [{IP}/{PREFIX}]\n"
+                "      routes:\n"
+                "        - to: default\n"
+                f"          via: {GATEWAY}\n"
+                "      nameservers:\n"
+                f"        addresses: [{', '.join(DNS)}]\n"
+            )
+            b64 = base64.b64encode(cfg.encode()).decode()
+            guest_exec(
+                f"echo '{b64}' | base64 -d > /etc/netplan/60-lan.yaml\n"
+                "netplan apply\n"
+            )
+        else:
+            print("Method: Debian/Ubuntu /etc/network/interfaces")
+            import base64
+            stanza = (
+                f"\nauto {IFACE}\n"
+                f"iface {IFACE} inet static\n"
+                f"    address {IP}/{PREFIX}\n"
+                f"    gateway {GATEWAY}\n"
+                f"    dns-nameservers {dns_str}\n"
+            )
+            b64 = base64.b64encode(stanza.encode()).decode()
+            guest_exec(
+                f"sed -i '/^auto {IFACE}/,/^$/d' /etc/network/interfaces 2>/dev/null || true\n"
+                f"echo '{b64}' | base64 -d >> /etc/network/interfaces\n"
+                f"ifdown {IFACE} 2>/dev/null || true\n"
+                f"ifup {IFACE} 2>/dev/null || "
+                f"(ip addr flush dev {IFACE}; ip addr add {IP}/{PREFIX} dev {IFACE}; "
+                f"ip link set {IFACE} up; "
+                f"ip route add default via {GATEWAY} dev {IFACE} 2>/dev/null || true)\n"
+            )
+
+    print(f"DONE: {IP}/{PREFIX} assigned to VMID {VMID} on {IFACE}")
+    PYEOF{% endraw %}
+  environment:
+    VMID:        "{{ vm.vmid }}"
+    IP:          "{{ vm.assigned_ip }}"
+    PREFIX:      "{{ vm.assigned_prefix }}"
+    GATEWAY:     "{{ vm.gateway }}"
+    DNS:         "{{ vm.dns_servers | join(' ') }}"
+    GUEST_IFACE: "{{ guest_iface }}"
+    OS_NAME:     "{{ os_name | default('unknown') }}"
+    OS_ID:       "{{ os_id | default('') }}"
+  register: assign_result
+  changed_when: true
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: "VMID {{ vm.vmid }} | Show assignment output"
+  ansible.builtin.debug:
+    msg: "{{ assign_result.stdout_lines | default(['no output']) }}"
+  when: agent_available | bool and (guest_iface | default('') | length > 0)

@@ -1,0 +1,140 @@
+##########################################################################
+# SETUP — per-user: VMID allocation + master list building
+###########################################################################
+
+###########################################################################
+# VM EXPANSION — flatten template+count definitions into per-VM entries
+###########################################################################
+
+- name: "{{ current_user.name }}: Reset user_vms"
+  ansible.builtin.set_fact:
+    user_vms: []
+
+- name: "{{ current_user.name }}: Expand VM definitions"
+  include_tasks: expand_vm.yaml
+  loop: "{{ current_user.vms }}"
+  loop_control:
+    loop_var: vm_def
+
+###########################################################################
+# VMID ALLOCATION — pull from global pool, skip already-claimed IDs
+###########################################################################
+
+- name: "{{ current_user.name }}: Build free VMID list"
+  ansible.builtin.set_fact:
+    free_vmids: >-
+      {{ range(vmid_start, vmid_end + 1)
+         | reject('in', (global_used_vmids + claimed_vmids) | map('int') | unique | list)
+         | list }}
+
+- name: "{{ current_user.name }}: Verify sufficient free VMIDs"
+  ansible.builtin.fail:
+    msg: >-
+      Not enough free VMIDs for {{ current_user.name }}.
+      Need {{ user_vms | length + 1 }}, found {{ free_vmids | length }}.
+  when: free_vmids | length < user_vms | length + 1
+
+- name: "{{ current_user.name }}: Set VyOS VMID"
+  ansible.builtin.set_fact:
+    vyos_vmid: "{{ free_vmids[0] }}"
+
+- name: "{{ current_user.name }}: Build VM plan"
+  ansible.builtin.set_fact:
+    vm_plan: >-
+      {{ vm_plan | default([]) + [
+           item | combine({'new_vmid': free_vmids[idx + 1], 'bridge': wan_bridge})
+         ] }}
+  loop: "{{ user_vms }}"
+  loop_control:
+    index_var: idx
+
+###########################################################################
+# MASTER CLONE LIST
+###########################################################################
+
+- name: "{{ current_user.name }}: Add VyOS to master clone list"
+  ansible.builtin.set_fact:
+    master_clone_list: >-
+      {{ master_clone_list + [{
+           'src_vmid':   vyos_template_vmid | string,
+           'new_vmid':   vyos_vmid | string,
+           'name':       'VyOS-' + current_user.name,
+           'full_clone': templates['vyos-dhcp'].full_clone | default(0)
+         }] }}
+
+- name: "{{ current_user.name }}: Add VMs to master clone list"
+  ansible.builtin.set_fact:
+    master_clone_list: >-
+      {{ master_clone_list + [{
+           'src_vmid':   item.vmid | string,
+           'new_vmid':   item.new_vmid | string,
+           'name':       item.name,
+           'full_clone': item.full_clone | default(0)
+         }] }}
+  loop: "{{ vm_plan }}"
+
+###########################################################################
+# MASTER CONFIG LISTS (Proxmox-level: NICs, CPU, RAM)
+###########################################################################
+
+- name: "{{ current_user.name }}: Add VyOS Proxmox config"
+  ansible.builtin.set_fact:
+    master_vyos_configs: >-
+      {{ master_vyos_configs + [{
+           'vmid':       vyos_vmid | string,
+           'name':       'VyOS-' + current_user.name,
+           'cores':      vyos_cores,
+           'memory':     vyos_memory,
+           'wan_bridge': vyos_wan_bridge,
+           'lan_bridge': vyos_lan_bridge,
+           'net0_mac':   vyos_net0_mac,
+           'net1_mac':   vyos_net1_mac
+         }] }}
+
+- name: "{{ current_user.name }}: Add VM Proxmox configs"
+  ansible.builtin.set_fact:
+    master_vm_configs: >-
+      {{ master_vm_configs + [{
+           'new_vmid': item.new_vmid | string,
+           'cores':    item.cores,
+           'memory':   item.memory,
+           'bridge':   wan_bridge,
+           'nic_type': item.nic_type
+         }] }}
+  loop: "{{ vm_plan }}"
+
+###########################################################################
+# POOL PLAN — per-user pool metadata
+###########################################################################
+
+- name: "{{ current_user.name }}: Add pool plan entry"
+  ansible.builtin.set_fact:
+    master_pool_plan: >-
+      {{ master_pool_plan + [{
+           'pool_name': 'Deployment1R-' + current_user.name,
+           'user_name': current_user.name,
+           'vmids':     [vyos_vmid | string] + vm_plan | map(attribute='new_vmid') | map('string') | list
+         }] }}
+
+###########################################################################
+# VMID TRACKING — update global claim lists
+###########################################################################
+
+- name: "{{ current_user.name }}: Track all VMIDs"
+  ansible.builtin.set_fact:
+    master_pool_vmids: >-
+      {{ master_pool_vmids + [vyos_vmid | string]
+         + vm_plan | map(attribute='new_vmid') | map('string') | list }}
+    claimed_vmids: >-
+      {{ claimed_vmids + [vyos_vmid | string]
+         + vm_plan | map(attribute='new_vmid') | map('string') | list }}
+
+###########################################################################
+# CLEAR PER-USER TEMPORARIES
+###########################################################################
+
+- name: "{{ current_user.name }}: Clear per-user temps"
+  ansible.builtin.set_fact:
+    vm_plan:   []
+    user_vms:  []
+    vyos_vmid: ""

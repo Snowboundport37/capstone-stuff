@@ -1,0 +1,83 @@
+{
+  "family": "WannaCry",
+  "signature_tags": [
+    "WannaCry",
+    "filecoder",
+    "Ransom:Win32/Filecoder!MSR"
+  ],
+  "primary_sample": {
+    "file_name": "main_Cry.exe",
+    "sha256": "b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf",
+    "sha1": "3e96e1f6a2d7cc6b72473d141e1962260325a0e7",
+    "md5": "70920f342814ca5c662cbbed00d60eef"
+  },
+  "hashes": {
+    "sha256": [
+      "b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf",
+      "c34af1f1f238747d6839ce6857138e97d722443c4e2a794c072c236228ceaa07",
+      "24a9111b7026a579229985ac10675836928875bbcc59320fd9d6189fd27efa5c",
+      "1498c83e12e72e16da4319941ddbe65947c98a1b00771bfb168fe01c03f2ac75"
+    ],
+    "sha1": [
+      "3e96e1f6a2d7cc6b72473d141e1962260325a0e7",
+      "22b77310e703ab819ac1ffd2335a93e8116b3319"
+    ],
+    "md5": [
+      "70920f342814ca5c662cbbed00d60eef",
+      "e1c3b51e85583197055cc32270a110e1",
+      "19389d1834aef91cce70b4de4ae95883"
+    ]
+  },
+  "artifact_names": [
+    "main_Cry.exe",
+    "@WanaDecryptor@.exe",
+    "@Please_Read_Me@.txt",
+    "@WanaDecryptor@.bmp",
+    "tasksche.exe",
+    "taskdl.exe",
+    "taskse.exe",
+    "m.vbs",
+    "b.wnry",
+    "c.wnry",
+    "f.wnry",
+    "00000000.eky",
+    "00000000.pky",
+    "00000000.res",
+    "Public.KEY"
+  ],
+  "services": {
+    "known_name": "mssecsvc2.0",
+    "display_name_pattern": "Microsoft Security Center (2.0) Service",
+    "path_parameter_pattern": "-m security"
+  },
+  "registry": {
+    "run_key_path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "wanacrypt0r_key_path": "HKLM\\SOFTWARE\\WanaCrypt0r",
+    "wanacrypt0r_value_name": "wd",
+    "wallpaper_path": "HKCU\\Control Panel\\Desktop",
+    "wallpaper_value_name": "Wallpaper"
+  },
+  "kill_switch_domains": [
+    "www.iuqerfsodp9ifjaposdfjhgosurijfaewrwergwea.com",
+    "www.ifferfsodp9ifjaposdfjhgosurijfaewrwergwea.com"
+  ],
+  "ms17_010_kbs": [
+    "KB4012212",
+    "KB4012213",
+    "KB4012214",
+    "KB4012215",
+    "KB4012216",
+    "KB4012217",
+    "KB4012598",
+    "KB4012606",
+    "KB4013198",
+    "KB4013429",
+    "KB4015217"
+  ],
+  "scan_paths": [
+    "%SystemDrive%\\Users",
+    "%SystemDrive%\\ProgramData",
+    "%SystemDrive%\\Windows\\Temp",
+    "%SystemDrive%\\Temp"
+  ]
+}

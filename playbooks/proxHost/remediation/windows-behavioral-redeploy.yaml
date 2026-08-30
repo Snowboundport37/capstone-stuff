@@ -1,0 +1,165 @@
+---
+- name: Behavioral Windows Detection and Golden-Image Redeploy
+  hosts: "{{ remediator_host | default('remediator') }}"
+  become: yes
+  gather_facts: yes
+
+  vars:
+    remediator_host: "{{ remediator_host | default('remediator') }}"
+    template_node: pve-node
+    proxmox_target_node: pve-node
+    proxmox_target_host: remediator
+
+    # If empty, playbook scans running VMs within vmid_range.
+    scan_vmids: []
+    vmid_range_start: 2000
+    vmid_range_end: 2100
+
+    replace_infected: true
+    start_redeployed_vm: true
+
+    detection_lookback_hours: 6
+    detection_high_cpu_seconds: 120
+    detection_high_memory_mb: 600
+    detection_powershell_burst_threshold: 10
+    detection_score_threshold: 60
+    enable_powershell_logging: true
+
+    # Override per production VMID when needed (example: {"2004": 3001}).
+    vmid_template_overrides: {}
+
+    default_windows_template_vmid: 3001
+    golden_template_map:
+      win10: 3001
+      win11: 3002
+      winsrv: 3003
+      malware: 3013
+
+    helper_dir: /tmp/windows-behavioral-redeploy
+    host_report_dir: /tmp/windows-behavioral-reports
+    report_ts: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    report_path: "{{ host_report_dir }}/behavioral-redeploy-{{ report_ts }}.json"
+
+    guest_ps: "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    guest_stage_dir: "C:/ProgramData/BehavioralRedeploy"
+    guest_ps1: "C:/ProgramData/BehavioralRedeploy/windows-behavioral-detect.ps1"
+    guest_b64: "C:/ProgramData/BehavioralRedeploy/stage.b64"
+    guest_exec_timeout_seconds: 360
+    guest_chunk_size: 2200
+    guest_chunk_write_attempts: 8
+
+  tasks:
+    - name: Show run configuration
+      ansible.builtin.debug:
+        msg:
+          - "remediator_host={{ remediator_host }}"
+          - "replace_infected={{ replace_infected }}"
+          - "range={{ vmid_range_start }}-{{ vmid_range_end }}"
+          - "scan_vmids={{ scan_vmids | default([]) }}"
+          - "report_path={{ report_path }}"
+
+    - name: Assert remediator host matches runtime host
+      ansible.builtin.assert:
+        that:
+          - ansible_hostname == remediator_host or inventory_hostname == remediator_host
+        fail_msg: "This play must run on remediator_host={{ remediator_host }}."
+
+    - name: Reset helper working directory
+      ansible.builtin.file:
+        path: "{{ helper_dir }}"
+        state: absent
+
+    - name: Create helper working directory
+      ansible.builtin.file:
+        path: "{{ helper_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Copy detection assets to helper directory
+      ansible.builtin.copy:
+        src: "files/{{ item.src }}"
+        dest: "{{ helper_dir }}/{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: "windows-behavioral-detect.ps1", dest: "windows-behavioral-detect.ps1", mode: "0600" }
+        - { src: "guest_stage_and_remediate.py", dest: "guest_stage_and_remediate.py", mode: "0755" }
+
+    - name: Discover running VMIDs in scan range
+      when: (scan_vmids | default([]) | length) == 0
+      ansible.builtin.shell: |
+        qm list | awk 'NR>1 { if ($1 >= {{ vmid_range_start }} && $1 <= {{ vmid_range_end }} && $3 == "running") print $1 }'
+      register: discovered_vmids
+      changed_when: false
+
+    - name: Set candidate VMIDs from explicit list
+      when: (scan_vmids | default([]) | length) > 0
+      ansible.builtin.set_fact:
+        candidate_vmids: "{{ scan_vmids | map('int') | list }}"
+
+    - name: Set candidate VMIDs from discovery
+      when: (scan_vmids | default([]) | length) == 0
+      ansible.builtin.set_fact:
+        candidate_vmids: "{{ discovered_vmids.stdout_lines | default([]) | map('int') | list }}"
+
+    - name: Assert at least one candidate VM was found
+      ansible.builtin.assert:
+        that:
+          - candidate_vmids | length > 0
+        fail_msg: >-
+          No candidate VMs found. Provide -e "scan_vmids=[2004,2005]" or adjust vmid_range_start/vmid_range_end.
+
+    - name: Initialize remediation report entries
+      ansible.builtin.set_fact:
+        remediation_report_entries: []
+
+    - name: Assess and optionally redeploy each VM
+      ansible.builtin.include_tasks: tasks/windows_behavioral_redeploy_vm.yml
+      loop: "{{ candidate_vmids }}"
+      loop_control:
+        loop_var: current_vmid
+        label: "vmid={{ current_vmid }}"
+
+    - name: Build report payload
+      ansible.builtin.set_fact:
+        report_payload:
+          generated_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          remediator_host: "{{ inventory_hostname }}"
+          proxmox_target_node: "{{ proxmox_target_node }}"
+          replace_infected: "{{ replace_infected }}"
+          detection:
+            lookback_hours: "{{ detection_lookback_hours }}"
+            high_cpu_seconds: "{{ detection_high_cpu_seconds }}"
+            high_memory_mb: "{{ detection_high_memory_mb }}"
+            powershell_burst_threshold: "{{ detection_powershell_burst_threshold }}"
+            score_threshold: "{{ detection_score_threshold }}"
+            enable_powershell_logging: "{{ enable_powershell_logging }}"
+          golden_image_selection:
+            vmid_template_overrides: "{{ vmid_template_overrides }}"
+            default_windows_template_vmid: "{{ default_windows_template_vmid }}"
+            golden_template_map: "{{ golden_template_map }}"
+          entries: "{{ remediation_report_entries }}"
+
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ host_report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write remediation report to disk
+      ansible.builtin.copy:
+        dest: "{{ report_path }}"
+        mode: "0644"
+        content: "{{ report_payload | to_nice_json }}"
+
+    - name: Print report location
+      ansible.builtin.debug:
+        msg:
+          - "Behavioral remediation run complete."
+          - "Report written to {{ report_path }}"
+          - "entries={{ remediation_report_entries | length }}"
+
+  post_tasks:
+    - name: Clean helper working directory
+      ansible.builtin.file:
+        path: "{{ helper_dir }}"
+        state: absent

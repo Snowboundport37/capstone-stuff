@@ -1,0 +1,7 @@
+users:
+  - name: john
+    bridge_ip: "10.10.20.1"
+  - name: sarah
+    bridge_ip: "10.10.21.1"
+  - name: mike
+    bridge_ip: "10.10.22.1"

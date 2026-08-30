@@ -1,0 +1,21 @@
+---
+  - name: "{{ deployment_name }}"
+    hosts: localhost
+    gather_facts: no
+
+    collections:
+      - community.proxmox
+
+    vars_files:
+      - roster.yaml
+      - credentials.yaml
+
+    vars:
+      vmid_counter: "{{ vmid_start }}"
+
+    tasks:
+      - name: Deploy all VM groups
+        include_tasks: deploy_vm.yaml
+        loop: "{{ vms }}"
+        loop_control:
+          loop_var: vm_group

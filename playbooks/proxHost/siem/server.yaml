@@ -1,0 +1,196 @@
+---
+# Installs Velociraptor server on a single Linux VM via QEMU guest agent.
+# No SSH required — all commands go through qm guest exec.
+# The VM downloads the binary directly from GitHub (requires internet in the VM).
+#
+# Required runtime variable (no default — must be passed with -e):
+#   velo_server_vmid   VMID of the Linux VM that will run the server
+#
+# Example:
+#   ansible-playbook -i inventory/hosts.yaml Siem/velociraptor/server.yaml \
+#     -e "velo_server_vmid=108"
+#
+# After completion:
+#   GUI:    https://<server_vm_ip>:8889   user/pass: see vars below
+#   Agents: https://<server_vm_ip>:8000
+#   Client config saved to /tmp/velociraptor-client.config.yaml on Proxmox host
+
+- name: Install Velociraptor server via QEMU agent
+  hosts: pve-node
+  become: yes
+  gather_facts: yes
+
+  vars:
+    velo_version:        "v0.76.1"
+    velo_release:        "v0.76"
+    velo_frontend_port:  8000
+    velo_gui_port:       8889
+    velo_admin_user:     "admin"
+    velo_admin_password: "CHANGE_ME"
+
+    velo_linux_url: >-
+      https://github.com/Velocidex/velociraptor/releases/download/{{ velo_release }}/velociraptor-{{ velo_version }}-linux-amd64-musl
+
+  tasks:
+
+    - name: Assert velo_server_vmid was provided at runtime
+      ansible.builtin.assert:
+        that: velo_server_vmid is defined
+        fail_msg: "You must pass -e velo_server_vmid=<VMID> on the command line."
+
+    - name: Check QEMU agent is accessible on server VM
+      ansible.builtin.shell: qm agent {{ velo_server_vmid }} ping
+      register: agent_ping
+      failed_when: agent_ping.rc != 0
+      changed_when: false
+
+    - name: Install Velociraptor server inside VM
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json, subprocess, base64, time, sys, textwrap
+
+        VMID          = "{{ velo_server_vmid }}"
+        BINARY_URL    = "{{ velo_linux_url }}"
+        ADMIN_USER    = "{{ velo_admin_user }}"
+        ADMIN_PASS    = "{{ velo_admin_password }}"
+        FRONTEND_PORT = {{ velo_frontend_port }}
+        GUI_PORT      = {{ velo_gui_port }}
+
+        def exec_vm(cmd_list):
+            r = subprocess.run(
+                ["qm", "guest", "exec", VMID, "--"] + cmd_list,
+                capture_output=True, text=True
+            )
+            if r.returncode != 0:
+                raise RuntimeError(f"qm exec failed: {r.stderr.strip()}")
+            result = json.loads(r.stdout)
+            out  = result.get("out-data",  "").strip()
+            err  = result.get("err-data",  "").strip()
+            code = result.get("exitcode", 0)
+            if code != 0:
+                raise RuntimeError(f"command exited {code}: {err or out}")
+            return out, code
+
+        def shell(cmd):
+            return exec_vm(["bash", "-c", cmd])
+
+        print("Getting server VM IP...")
+        ip, _ = shell("hostname -I | awk '{print $1}'")
+        SERVER_IP = ip.strip()
+        if not SERVER_IP:
+            print("ERROR: Could not get VM IP", file=sys.stderr)
+            sys.exit(1)
+        print(f"Server VM IP: {SERVER_IP}")
+
+        print("Downloading Velociraptor binary...")
+        shell(
+            f"if command -v curl >/dev/null 2>&1; then "
+            f"  curl -fsSL '{BINARY_URL}' -o /usr/local/bin/velociraptor; "
+            f"else "
+            f"  wget -qO /usr/local/bin/velociraptor '{BINARY_URL}'; "
+            f"fi && chmod 755 /usr/local/bin/velociraptor"
+        )
+
+        print("Creating directories...")
+        shell("mkdir -p /etc/velociraptor /var/lib/velociraptor /var/log/velociraptor")
+
+        print("Generating server config...")
+        shell("/usr/local/bin/velociraptor config generate > /etc/velociraptor/server.config.yaml")
+        shell(f"sed -i 's/hostname:.*/hostname: {SERVER_IP}/' /etc/velociraptor/server.config.yaml")
+        shell(f"sed -i 's|- https://localhost:[0-9]*/|- https://{SERVER_IP}:{FRONTEND_PORT}/|' /etc/velociraptor/server.config.yaml")
+        shell("sed -i '/^GUI:/,/bind_address:/ s/127\\.0\\.0\\.1/0.0.0.0/' /etc/velociraptor/server.config.yaml")
+
+        print("Installing systemd service...")
+        svc_unit = textwrap.dedent("""\
+            [Unit]
+            Description=Velociraptor DFIR Server
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=root
+            ExecStart=/usr/local/bin/velociraptor --config /etc/velociraptor/server.config.yaml frontend -v
+            Restart=on-failure
+            RestartSec=5
+            LimitNOFILE=65536
+
+            [Install]
+            WantedBy=multi-user.target
+            """)
+        b64 = base64.b64encode(svc_unit.encode()).decode()
+        shell(f"echo '{b64}' | base64 -d > /etc/systemd/system/velociraptor_server.service")
+        shell("systemctl daemon-reload && systemctl enable --now velociraptor_server")
+
+        print("Waiting for server to start...")
+        time.sleep(15)
+
+        print("Creating admin user...")
+        shell(f"/usr/local/bin/velociraptor --config /etc/velociraptor/server.config.yaml "
+              f"user add --role administrator {ADMIN_USER} {ADMIN_PASS}")
+
+        print("Extracting client config...")
+        client_cfg, _ = exec_vm([
+            "/usr/local/bin/velociraptor", "config", "client",
+            "--config", "/etc/velociraptor/server.config.yaml"
+        ])
+        if not client_cfg:
+            raise RuntimeError("velociraptor config client produced no output")
+        with open("/tmp/velociraptor-client.config.yaml", "w") as f:
+            f.write(client_cfg)
+        print("Client config saved to /tmp/velociraptor-client.config.yaml")
+
+        print(json.dumps({
+            "success":    True,
+            "server_ip":  SERVER_IP,
+            "gui":        f"https://{SERVER_IP}:{GUI_PORT}",
+            "agent_url":  f"https://{SERVER_IP}:{FRONTEND_PORT}"
+        }))
+        PYEOF
+      args:
+        executable: /bin/bash
+      register: server_result
+      failed_when: false
+
+    - name: Show server install result
+      ansible.builtin.debug:
+        msg:
+          stdout: "{{ server_result.stdout_lines }}"
+          stderr: "{{ server_result.stderr_lines }}"
+          rc:     "{{ server_result.rc }}"
+
+    - name: Fetch client config from server VM to Proxmox host
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json, subprocess, sys
+
+        VMID = "{{ velo_server_vmid }}"
+        r = subprocess.run(
+            ["qm", "guest", "exec", VMID, "--",
+             "/usr/local/bin/velociraptor", "config", "client",
+             "--config", "/etc/velociraptor/server.config.yaml"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
+            print(f"qm exec failed: {r.stderr.strip()}", file=sys.stderr)
+            sys.exit(1)
+        result = json.loads(r.stdout)
+        config = result.get("out-data", "").strip()
+        if not config:
+            print("velociraptor config client produced no output", file=sys.stderr)
+            sys.exit(1)
+        with open("/tmp/velociraptor-client.config.yaml", "w") as f:
+            f.write(config)
+        print("Client config saved to /tmp/velociraptor-client.config.yaml")
+        PYEOF
+      args:
+        executable: /bin/bash
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Velociraptor server deployed."
+          - "GUI:    {{ (server_result.stdout_lines | select('match', '^\\{') | list | last | default('{}')) | from_json | json_query('gui') | default('see server_result above') }}"
+          - "User:   {{ velo_admin_user }}  Pass: {{ velo_admin_password }}"
+          - "Client config: /tmp/velociraptor-client.config.yaml on this host"
+      when: server_result.rc == 0
+

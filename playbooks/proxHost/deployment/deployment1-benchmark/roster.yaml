@@ -1,0 +1,99 @@
+wan_bridge: vmbr3
+
+templates:
+  fakenet:
+    vmid: 3000
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 0
+  win10:
+    vmid: 3001
+    cores: 2
+    memory: 4096
+    nic_type: e1000
+    full_clone: 0
+  win11:
+    vmid: 3002
+    cores: 2
+    memory: 4096
+    nic_type: e1000
+    full_clone: 0
+  winsrv:
+    vmid: 3003
+    cores: 4
+    memory: 4096
+    nic_type: e1000
+    full_clone: 0
+  ubusrv:
+    vmid: 3004
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 0
+  ubu:
+    vmid: 3005
+    cores: 1
+    memory: 4096
+    nic_type: virtio
+    full_clone: 0
+  rocky:
+    vmid: 3006
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 0
+  kali:
+    vmid: 3007
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 0
+  vyos:
+    vmid: 3008
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 1
+  pfsense:
+    vmid: 3009
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 0
+  vyos-gw:
+    vmid: 3010
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 1
+  vyos-dhcp:
+    vmid: 3011
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 1
+  zeek:
+    vmid: 3012
+    cores: 3
+    memory: 4096
+    nic_type: virtio
+    full_clone: 0
+  malware:
+    vmid: 3013
+    cores: 1
+    memory: 2048
+    nic_type: virtio
+    full_clone: 0
+
+users:
+  - name: ASCII
+    vms:
+      - template: win10
+        count: 2
+      - template: ubusrv
+        count: 3
+      - template: rocky
+        count: 2
+      - template: kali
+        count: 2

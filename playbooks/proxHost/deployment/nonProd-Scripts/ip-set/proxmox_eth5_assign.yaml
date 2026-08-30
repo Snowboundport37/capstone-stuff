@@ -1,0 +1,64 @@
+- name: Assign static IPs to Proxmox VMs on vmbr5 using QEMU agent
+  hosts: remediator
+  gather_facts: no
+
+  vars:
+    bridge_name: "vmbr5"
+    subnet_base: "10.10.10"
+    gateway: "10.10.10.1"
+    prefix_len: 24
+    dns_servers:
+      - "10.10.10.1"
+    ip_start: 2
+    agent_timeout: 120       # seconds to wait for guest agent after reboot
+    agent_poll_interval: 5   # seconds between agent ping retries
+    # VMs to exclude entirely (matched case-insensitive against VM name)
+    exclude_vms:
+      - "Vyos-bob"
+    # VyOS router gets a fixed IP as the LAN gateway
+    vyos_ip: "10.10.10.1"
+    vyos_prefix: 24
+
+  tasks:
+
+  - name: Get VM list
+    shell: qm list
+    register: qm_list
+    changed_when: false
+
+  - name: Parse VMIDs
+    set_fact:
+      vmids: >-
+        {{ qm_list.stdout_lines[1:]
+           | map('regex_replace', '^\s*(\d+).*', '\1')
+           | select('match', '^\d+$')
+           | list }}
+
+  - name: Get VM configs
+    shell: qm config {{ item }}
+    loop: "{{ vmids }}"
+    register: vm_configs
+    changed_when: false
+
+  # Build list of VMs that have a NIC on vmbr5, capturing the MAC and name.
+  # Handles virtio, e1000, e1000e, rtl8139, and vmxnet3 NIC types.
+  - name: Build VM list (VMs bridged to {{ bridge_name }} only)
+    set_fact:
+      vm_list_raw: >-
+        {{ vm_list_raw | default([]) + [{
+            'vmid': item.item,
+            'name': (item.stdout | regex_findall('(?m)^name:\s*(\S+)') | first | default('')),
+            'mac': (item.stdout
+                | regex_search('(?:virtio|e1000e?|rtl8139|vmxnet3)=([0-9A-Fa-f:]{17})[^\n]*bridge=' + bridge_name)
+                | default('')
+                | regex_search('[0-9A-Fa-f:]{17}')
+                | default(''))
+        }] }}
+    loop: "{{ vm_configs.results }}"
+    when: "'bridge=' + bridge_name in item.stdout"
+
+  - name: Fail if no VMs found on {{ bridge_name }}
+    fail:
+      msg: "No VMs with a NIC bridged to {{ bridge_name }} were found."
+    when: vm_list_raw is not defined or vm_list_raw | length == 0
+

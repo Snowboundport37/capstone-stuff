@@ -6,7 +6,7 @@ I am Andrei Gorlitsky. This is the public writeup of my Champlain College senior
 
 It is a **team project**. Git history on the private class repo includes [Snowboundport37](https://github.com/Snowboundport37) (me), seraphim, seraphimgerber, and ConnorEast. I wrote a lot of the detection and remediation loop. I did not write every playbook. Ask me in person which files are mine.
 
-This repository is documentation. It is not a clone-and-run lab. The private source stays in the class org until credentials are stripped from git history.
+The private class repo (`ASC-ll/Capstone`) stays private. This public repo now also holds a **sanitized snapshot** of that tree (`inventories/`, `playbooks/`): IPs are documentation addresses (`10.10.0.0/24`), passwords are `CHANGE_ME`, teammate hostnames are `pve-node` / `remediator`. See [SANITIZED.md](SANITIZED.md). It still will not hit our lab if you clone it.
 
 **Wiki (start here if you want the long form with a sidebar):** [github.com/Snowboundport37/capstone-stuff/wiki](https://github.com/Snowboundport37/capstone-stuff/wiki)
 

@@ -1,0 +1,73 @@
+---
+- name: Deployment 2 Small Workplace is deploying
+  hosts: localhost
+  gather_facts: no
+  become: true
+
+  vars_files:
+    - roster.yaml
+
+  vars:
+    ###########################################################################
+    # PROXMOX CONTROL
+    ###########################################################################
+    template_node: pve-node
+    proxmox_target_node: pve-node
+    proxmox_target_host: remediator
+
+    ###########################################################################
+    # NETWORK BRIDGE CONFIG (will be overridden per user)
+    ###########################################################################
+    bridge_netmask: "255.255.255.0"
+    bridge_cidr: "/24"
+
+    ###########################################################################
+    # VMID RANGE
+    ###########################################################################
+    vmid_start: 2000
+    vmid_end: 2100
+
+    ###########################################################################
+    # TEMPLATE VMIDS
+    ###########################################################################
+    win10_tmp: 3001
+    win_srv: 3003
+    ubu_srv: 3004
+    ubuntu: 3005
+    rocky: 3006
+
+    ###########################################################################
+    # VMS TO DEPLOY (base template)
+    ###########################################################################
+    vms_template:
+      - name: Workstation
+        template_vmid: "{{ win10_tmp }}"
+        cores: 4
+        memory: 8192
+
+      - name: Backend-server
+        template_vmid: "{{ win_srv }}"
+        cores: 4
+        memory: 16384
+
+      - name: Rocky-Station
+        template_vmid: "{{ rocky }}"
+        cores: 2
+        memory: 4096
+
+      - name: Zeek
+        template_vmid: "{{ ubuntu }}"
+        cores: 2
+        memory: 2048
+
+      - name: WebServer
+        template_vmid: "{{ ubu_srv }}"
+        cores: 2
+        memory: 2048
+
+  tasks:
+    - name: Deploy environment for each user
+      include_tasks: deploy_user.yaml
+      loop: "{{ users }}"
+      loop_control:
+        loop_var: current_user

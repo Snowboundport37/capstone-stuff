@@ -1,0 +1,29 @@
+---
+deployment_name: "Deployment 1: 10 VMs"
+proxmox_node: pve-node
+vmid_start: 2000
+
+vms:
+  - template: win10
+    count: 2
+    name_prefix: "Win10-WS"
+
+  - template: ubuntu_srv
+    count: 3
+    name_prefix: "Ubuntu-Srv"
+
+  - template: rocky
+    count: 2
+    name_prefix: "Rocky-App"
+
+  - template: kali
+    count: 1
+    name_prefix: "Kali-Sec"
+
+  - template: vyos_gw
+    count: 1
+    name_prefix: "VyOS-GW"
+
+  - template: vyos_dhcp
+    count: 1
+    name_prefix: "VyOS-DHCP"

@@ -1,0 +1,260 @@
+---
+###############################################################################
+# scan.yml
+# Entry point for malware detection + remediation pipeline.
+#
+# Usage:
+#   ansible-playbook scan.yml
+#   ansible-playbook scan.yml -e replace_infected=false   # scan only, no rollback
+#
+# Runs detection on all target VMs in parallel.
+# Report is written to /tmp/remediation_report_<timestamp>.json on controller.
+###############################################################################
+
+###############################################################################
+# PLAY 1: SETUP — register hosts, validate, copy helpers to remediator
+###############################################################################
+- name: Setup — register hosts and prepare
+  hosts: localhost
+  gather_facts: no
+
+  vars:
+    proxmox_target_host: remediator
+    proxmox_target_node: pve-node
+
+    target_vmids:
+      - vmid: 2004
+        label: wannacry-ASCII
+      - vmid: 2005
+        label: lokibot-ASCII
+      - vmid: 2015
+        label: kovter-ascii
+
+    clean_snapshot: pre-malware-421
+    helper_dir: "{{ playbook_dir }}"
+
+    detection_score_threshold:            12
+    detection_min_strong_hits:            2
+    detection_min_categories:             2
+    detection_lookback_hours:             24
+    detection_high_cpu_seconds:           3
+    detection_high_memory_mb:             500
+    detection_powershell_burst_threshold: 5
+    detection_stager_recent_minutes:      15
+    detection_require_ps_stager_obfuscation: false
+    detection_enable_registry_blob_scan:  false
+    detection_overrides_by_vmid:
+      "2004":
+        detection_require_ps_stager_obfuscation: true
+
+    replace_infected:    true
+    start_redeployed_vm: true
+
+    guest_exec_timeout_seconds:   180
+    guest_chunk_size:             8000
+    guest_chunk_write_attempts:   8
+    helper_max_runtime_seconds:   300
+    helper_poll_seconds:          5
+    vm_parallel_limit:            3
+    qga_ping_retries:             12
+    qga_ping_delay_seconds:       3
+    qga_pre_exec_retries:         10
+    qga_pre_exec_delay_seconds:   3
+
+    report_dir:  /tmp
+    report_time: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+
+  tasks:
+
+    - name: Register remediator host
+      ansible.builtin.add_host:
+        name: remediator
+        ansible_host:            10.10.0.1
+        ansible_port:            49154
+        ansible_user:            root
+        ansible_password:        "CHANGE_ME"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+    - name: Validate remediation snapshot is pinned
+      ansible.builtin.assert:
+        that:
+          - clean_snapshot == 'pre-malware-421'
+        fail_msg: "clean_snapshot must be exactly 'pre-malware-421'."
+
+    - name: Record pipeline start time
+      ansible.builtin.set_fact:
+        pipeline_start_time:  "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        pipeline_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: Clean up any previous result files
+      ansible.builtin.file:
+        path: "/tmp/vm_result_{{ item.vmid }}.json"
+        state: absent
+      loop: "{{ target_vmids }}"
+
+    - name: Copy helper script to remediator
+      ansible.builtin.copy:
+        src: "{{ helper_dir }}/guest_stage_and_remediate.py"
+        dest: "/tmp/guest_stage_and_remediate.py"
+        mode: "0755"
+      delegate_to: remediator
+
+    - name: Copy detection PS1 to remediator
+      ansible.builtin.copy:
+        src: "{{ helper_dir }}/windows-behavioral-detect.ps1"
+        dest: "/tmp/windows-behavioral-detect.ps1"
+        mode: "0644"
+      delegate_to: remediator
+
+    # Register one fake host per VMID so play 2 can run them in parallel
+    - name: Register VM hosts for parallel execution
+      ansible.builtin.add_host:
+        name: "vm_{{ item.vmid }}"
+        groups: malware_vms
+        # Pass all needed vars as host vars
+        current_vmid:               "{{ item.vmid }}"
+        vm_label:                   "{{ item.label }}"
+        proxmox_target_host:        remediator
+        proxmox_target_node:        pve-node
+        clean_snapshot:             "{{ clean_snapshot }}"
+        helper_dir:                 "{{ helper_dir }}"
+        replace_infected:           "{{ replace_infected }}"
+        start_redeployed_vm:        "{{ start_redeployed_vm }}"
+        detection_score_threshold:  "{{ detection_score_threshold }}"
+        detection_min_strong_hits:  "{{ detection_min_strong_hits }}"
+        detection_min_categories:   "{{ detection_min_categories }}"
+        detection_lookback_hours:   "{{ detection_lookback_hours }}"
+        detection_high_cpu_seconds: "{{ detection_high_cpu_seconds }}"
+        detection_high_memory_mb:   "{{ detection_high_memory_mb }}"
+        detection_powershell_burst_threshold: "{{ detection_powershell_burst_threshold }}"
+        detection_stager_recent_minutes:      "{{ detection_stager_recent_minutes }}"
+        detection_require_ps_stager_obfuscation: "{{ detection_require_ps_stager_obfuscation }}"
+        detection_enable_registry_blob_scan:  "{{ detection_enable_registry_blob_scan }}"
+        detection_overrides_by_vmid:          "{{ detection_overrides_by_vmid }}"
+        guest_exec_timeout_seconds:   "{{ guest_exec_timeout_seconds }}"
+        guest_chunk_size:             "{{ guest_chunk_size }}"
+        guest_chunk_write_attempts:   "{{ guest_chunk_write_attempts }}"
+        helper_max_runtime_seconds:   "{{ helper_max_runtime_seconds }}"
+        helper_poll_seconds:          "{{ helper_poll_seconds }}"
+        vm_parallel_limit:            "{{ vm_parallel_limit }}"
+        qga_ping_retries:             "{{ qga_ping_retries }}"
+        qga_ping_delay_seconds:       "{{ qga_ping_delay_seconds }}"
+        qga_pre_exec_retries:         "{{ qga_pre_exec_retries }}"
+        qga_pre_exec_delay_seconds:   "{{ qga_pre_exec_delay_seconds }}"
+        report_dir:                   "{{ report_dir }}"
+      loop: "{{ target_vmids }}"
+
+    - name: Show pipeline start
+      ansible.builtin.debug:
+        msg: "Pipeline started at {{ pipeline_start_time }} — running up to {{ vm_parallel_limit }} VMs in parallel"
+
+###############################################################################
+# PLAY 2: DETECTION — runs per_vm_scan.yml on all VMs simultaneously
+###############################################################################
+- name: Detection and Remediation — all VMs in parallel
+  hosts: malware_vms
+  gather_facts: no
+  strategy: free   # free strategy = hosts do not wait on each other
+  serial: "{{ vm_parallel_limit | default(2) }}"
+
+  tasks:
+    - name: Run detection and remediation for this VM
+      ansible.builtin.include_tasks: per_vm_scan.yml
+
+###############################################################################
+# PLAY 3: REPORT — merge result files and write final report
+###############################################################################
+- name: Report — merge results and write final report
+  hosts: localhost
+  gather_facts: no
+
+  vars:
+    report_dir:  /tmp
+    report_time: "{{ lookup('pipe', 'date -u +%Y%m%dT%H%M%SZ') }}"
+    target_vmids:
+      - vmid: 2004
+        label: wannacry-ASCII
+      - vmid: 2005
+        label: lokibot-ASCII
+      - vmid: 2015
+        label: kovter-ascii
+    detection_score_threshold: 12
+
+  tasks:
+
+    - name: Record pipeline end time
+      ansible.builtin.set_fact:
+        pipeline_end_time:  "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+        pipeline_end_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: Read per-VM result files
+      ansible.builtin.slurp:
+        src: "/tmp/vm_result_{{ item.vmid }}.json"
+      register: vm_result_files
+      loop: "{{ target_vmids }}"
+      loop_control:
+        label: "{{ item.label }}"
+      failed_when: false
+
+    - name: Parse per-VM results
+      ansible.builtin.set_fact:
+        remediation_report_entries: >-
+          {{
+            vm_result_files.results
+            | selectattr('content', 'defined')
+            | map(attribute='content')
+            | map('b64decode')
+            | map('from_json')
+            | list
+          }}
+
+    - name: Build final report
+      ansible.builtin.set_fact:
+        final_report:
+          report_generated_at:       "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          score_threshold:           "{{ detection_score_threshold }}"
+          clean_snapshot:            "pre-malware-421"
+          pipeline_start_time:       "{{ hostvars['localhost']['pipeline_start_time'] | default('unknown') }}"
+          pipeline_end_time:         "{{ pipeline_end_time }}"
+          pipeline_duration_seconds: "{{ (pipeline_end_epoch | int) - (hostvars['localhost']['pipeline_start_epoch'] | default(pipeline_end_epoch) | int) }}"
+          vms_scanned:               "{{ remediation_report_entries | length }}"
+          vms_infected:              "{{ remediation_report_entries | selectattr('likely_infected', 'defined') | selectattr('likely_infected') | list | length }}"
+          vms_redeployed:            "{{ remediation_report_entries | selectattr('status', 'defined') | selectattr('status', 'equalto', 'redeployed') | list | length }}"
+          results:                   "{{ remediation_report_entries }}"
+
+    - name: Write JSON report
+      ansible.builtin.copy:
+        content: "{{ final_report | to_nice_json }}"
+        dest:    "{{ report_dir }}/remediation_report_{{ report_time }}.json"
+        mode:    '0644'
+
+    - name: Print report summary
+      ansible.builtin.debug:
+        msg:
+          - "══════════════════════════════════════════"
+          - "  Malware Detection Report"
+          - "══════════════════════════════════════════"
+          - "  Duration: {{ final_report.pipeline_duration_seconds }}s"
+          - "──────────────────────────────────────────"
+          - "  VMs scanned:    {{ final_report.vms_scanned }}"
+          - "  VMs infected:   {{ final_report.vms_infected }}"
+          - "  VMs redeployed: {{ final_report.vms_redeployed }}"
+          - "──────────────────────────────────────────"
+          - "  Full report: {{ report_dir }}/remediation_report_{{ report_time }}.json"
+          - "══════════════════════════════════════════"
+
+    - name: Print per-VM results
+      ansible.builtin.debug:
+        msg:
+          - "  VM      : {{ item.vm_name | default('VMID ' ~ item.vmid) }}"
+          - "  Status  : {{ item.status | default('unknown') }}"
+          - "  Score   : {{ item.detection_score | default('N/A') }} / threshold {{ detection_score_threshold }}"
+          - "  Confirmed: {{ item.confirmed_infection | default(false) }}"
+          - "  Decision: {{ item.detection_result.decision_reason | default('n/a') }}"
+          - "  Malware : {{ item.detection_result.malware_family_detected | default('none') }}"
+          - "  Detected: {{ item.detected_at | default('N/A') }}"
+          - "  Nuked   : {{ item.nuked_at | default('N/A') }}"
+          - "  Restored: {{ item.redeployed_at | default('N/A') }}"
+      loop: "{{ remediation_report_entries }}"
+      loop_control:
+        label: "{{ item.vm_name | default(item.vmid) }}"

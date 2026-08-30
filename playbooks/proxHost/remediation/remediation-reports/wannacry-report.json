@@ -1,0 +1,220 @@
+{
+    "actions": [],
+    "ansible_wrapper": {
+        "pass1_failed": false,
+        "pass1_rc": 0,
+        "pass2_failed": false,
+        "pass2_rc": 0,
+        "second_pass_attempted": true,
+        "target_vmid": 2004
+    },
+    "errors": [
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:689 char:87",
+        "+ ... ION WARNING: Everyone:Full found on $($d.FullName) \u0083?\" review manuall ...",
+        "+                                                            ~~~~~~",
+        "Unexpected token 'review' in expression or statement.",
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:804 char:66",
+        "+         if (-not $before -or -not $after -or $before -ne $after) {",
+        "+                                                                  ~",
+        "Missing closing '}' in statement block or type definition.",
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:801 char:36",
+        "+     foreach ($sp in $system_paths) {",
+        "+                                    ~",
+        "Missing closing '}' in statement block or type definition.",
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:800 char:46",
+        "+ Invoke-Safe \"System files integrity verdict\" {",
+        "+                                              ~",
+        "Missing closing '}' in statement block or type definition.",
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:688 char:78",
+        "+ ...    if ($txt -match '(?i)Everyone:\\(F\\)|Everyone:\\(OI\\)\\(CI\\)\\(F\\)') {",
+        "+                                                                         ~",
+        "Missing closing '}' in statement block or type definition.",
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:684 char:31",
+        "+         foreach ($d in $dirs) {",
+        "+                               ~",
+        "Missing closing '}' in statement block or type definition.",
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:680 char:34",
+        "+     foreach ($ar in $auditRoots) {",
+        "+                                  ~",
+        "Missing closing '}' in statement block or type definition.",
+        "At C:\\ProgramData\\WannaCryRemediation\\wannacry-remediate.ps1:676 char:54",
+        "+ Invoke-Safe \"Permission audit for Everyone:F grants\" {",
+        "+                                                      ~",
+        "Missing closing '}' in statement block or type definition.",
+        "    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException",
+        "    + FullyQualifiedErrorId : UnexpectedToken",
+        "Post-check found leftover indicators: processes=@WanaDecryptor@.exe | files=C:\\Users\\windows10\\Downloads\\Wannacry\\@Please_Read_Me@.txt;C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp;C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.exe;C:\\Users\\windows10\\Downloads\\Wannacry\\b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe;C:\\Users\\windows10\\Downloads\\Wannacry\\Public.KEY | dirs=C:\\Users\\windows10\\Desktop\\WannaCry_AES_KEY;C:\\Users\\windows10\\Downloads\\Wannacry;C:\\Users\\windows10\\Downloads\\WannaCry"
+    ],
+    "exitcode": 1,
+    "post_verify": {
+        "leftovers": "processes=@WanaDecryptor@.exe | files=C:\\Users\\windows10\\Downloads\\Wannacry\\@Please_Read_Me@.txt;C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp;C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.exe;C:\\Users\\windows10\\Downloads\\Wannacry\\b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe;C:\\Users\\windows10\\Downloads\\Wannacry\\Public.KEY | dirs=C:\\Users\\windows10\\Desktop\\WannaCry_AES_KEY;C:\\Users\\windows10\\Downloads\\Wannacry;C:\\Users\\windows10\\Downloads\\WannaCry",
+        "verify_clean": false
+    },
+    "state_post": {
+        "bmp_paths": [
+            "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp"
+        ],
+        "files": [
+            {
+                "name": "@Please_Read_Me@.txt",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\@Please_Read_Me@.txt",
+                "sha256": "64DFF0866187A31163499540F9912611162CF0726107F064AEF73C74D5B1BDFD"
+            },
+            {
+                "name": "@WanaDecryptor@.bmp",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp",
+                "sha256": "D5E0E8694DDC0548D8E6B87C83D50F4AB85C1DEBADB106D6A6A794C3E746F4FA"
+            },
+            {
+                "name": "@WanaDecryptor@.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.exe",
+                "sha256": "24A9111B7026A579229985AC10675836928875BBCC59320FD9D6189FD27EFA5C"
+            },
+            {
+                "name": "b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "sha256": "B547DC7A77AF8022ABBF19A7006213342444CAEA1CEDE20EA2409CE9BC9790BF"
+            },
+            {
+                "name": "Public.KEY",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\Public.KEY",
+                "sha256": "1498C83E12E72E16DA4319941DDBE65947C98A1B00771BFB168FE01C03F2AC75"
+            },
+            {
+                "name": "@Please_Read_Me@.txt",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\@Please_Read_Me@.txt",
+                "sha256": "64DFF0866187A31163499540F9912611162CF0726107F064AEF73C74D5B1BDFD"
+            },
+            {
+                "name": "@WanaDecryptor@.bmp",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\@WanaDecryptor@.bmp",
+                "sha256": "D5E0E8694DDC0548D8E6B87C83D50F4AB85C1DEBADB106D6A6A794C3E746F4FA"
+            },
+            {
+                "name": "@WanaDecryptor@.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\@WanaDecryptor@.exe",
+                "sha256": "24A9111B7026A579229985AC10675836928875BBCC59320FD9D6189FD27EFA5C"
+            },
+            {
+                "name": "b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "sha256": "B547DC7A77AF8022ABBF19A7006213342444CAEA1CEDE20EA2409CE9BC9790BF"
+            },
+            {
+                "name": "Public.KEY",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\Public.KEY",
+                "sha256": "1498C83E12E72E16DA4319941DDBE65947C98A1B00771BFB168FE01C03F2AC75"
+            },
+            {
+                "name": "h.wnry",
+                "path": "C:\\Users\\windows10\\Desktop\\WannaCry_AES_KEY\\h.wnry",
+                "sha256": "C4A81219109084F6DB1C8F37F7432AF946080FFAD27AB40A44887E667D97D5A0"
+            },
+            {
+                "name": "r.wnry",
+                "path": "C:\\Users\\windows10\\Desktop\\WannaCry_AES_KEY\\r.wnry",
+                "sha256": "46FA0DFDDA0D0F0EC2C1A25545C8D4C770B04BE32860CA91EBC624ABA6B279FA"
+            }
+        ],
+        "wallpaper": [
+            {
+                "sid": "S-1-5-21-14593734-2202681622-4048876568-1001",
+                "wallpaper": "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp"
+            }
+        ]
+    },
+    "state_pre": {
+        "bmp_paths": [
+            "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp"
+        ],
+        "files": [
+            {
+                "name": "@Please_Read_Me@.txt",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\@Please_Read_Me@.txt",
+                "sha256": "64DFF0866187A31163499540F9912611162CF0726107F064AEF73C74D5B1BDFD"
+            },
+            {
+                "name": "@WanaDecryptor@.bmp",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp",
+                "sha256": "D5E0E8694DDC0548D8E6B87C83D50F4AB85C1DEBADB106D6A6A794C3E746F4FA"
+            },
+            {
+                "name": "@WanaDecryptor@.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.exe",
+                "sha256": "24A9111B7026A579229985AC10675836928875BBCC59320FD9D6189FD27EFA5C"
+            },
+            {
+                "name": "b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "sha256": "B547DC7A77AF8022ABBF19A7006213342444CAEA1CEDE20EA2409CE9BC9790BF"
+            },
+            {
+                "name": "Public.KEY",
+                "path": "C:\\Users\\windows10\\Downloads\\Wannacry\\Public.KEY",
+                "sha256": "1498C83E12E72E16DA4319941DDBE65947C98A1B00771BFB168FE01C03F2AC75"
+            },
+            {
+                "name": "@Please_Read_Me@.txt",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\@Please_Read_Me@.txt",
+                "sha256": "64DFF0866187A31163499540F9912611162CF0726107F064AEF73C74D5B1BDFD"
+            },
+            {
+                "name": "@WanaDecryptor@.bmp",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\@WanaDecryptor@.bmp",
+                "sha256": "D5E0E8694DDC0548D8E6B87C83D50F4AB85C1DEBADB106D6A6A794C3E746F4FA"
+            },
+            {
+                "name": "@WanaDecryptor@.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\@WanaDecryptor@.exe",
+                "sha256": "24A9111B7026A579229985AC10675836928875BBCC59320FD9D6189FD27EFA5C"
+            },
+            {
+                "name": "b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\b547dc7a77af8022abbf19a7006213342444caea1cede20ea2409ce9bc9790bf.exe",
+                "sha256": "B547DC7A77AF8022ABBF19A7006213342444CAEA1CEDE20EA2409CE9BC9790BF"
+            },
+            {
+                "name": "Public.KEY",
+                "path": "C:\\Users\\windows10\\Downloads\\WannaCry\\Public.KEY",
+                "sha256": "1498C83E12E72E16DA4319941DDBE65947C98A1B00771BFB168FE01C03F2AC75"
+            },
+            {
+                "name": "h.wnry",
+                "path": "C:\\Users\\windows10\\Desktop\\WannaCry_AES_KEY\\h.wnry",
+                "sha256": "C4A81219109084F6DB1C8F37F7432AF946080FFAD27AB40A44887E667D97D5A0"
+            },
+            {
+                "name": "r.wnry",
+                "path": "C:\\Users\\windows10\\Desktop\\WannaCry_AES_KEY\\r.wnry",
+                "sha256": "46FA0DFDDA0D0F0EC2C1A25545C8D4C770B04BE32860CA91EBC624ABA6B279FA"
+            }
+        ],
+        "wallpaper": [
+            {
+                "sid": "S-1-5-21-14593734-2202681622-4048876568-1001",
+                "wallpaper": "C:\\Users\\windows10\\Downloads\\Wannacry\\@WanaDecryptor@.bmp"
+            }
+        ]
+    },
+    "success": false,
+    "validation": {
+        "artifact_counts": {
+            "post": 12,
+            "pre": 12
+        },
+        "artifacts_left_over": true,
+        "background_restored": false,
+        "hash_compare": {
+            "changed_paths": [],
+            "changed_paths_count": 0,
+            "common_paths_compared": 7
+        },
+        "pre_post_sha_constant": true,
+        "ransom_background_present": true,
+        "required_checks": {
+            "artifacts_left_over": "present",
+            "background_remains": "present",
+            "pre_post_sha_delta": "none"
+        }
+    }
+}

@@ -1,0 +1,288 @@
+- name: Set per-VM baseline facts
+  ansible.builtin.set_fact:
+    vm_scan_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+    vm_report_entry:
+      vmid: "{{ current_vmid }}"
+      scan_started_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: Read VM status
+  ansible.builtin.command:
+    argv:
+      - qm
+      - status
+      - "{{ current_vmid }}"
+  register: vm_status
+  changed_when: false
+  failed_when: false
+
+- name: Read VM config
+  ansible.builtin.command:
+    argv:
+      - qm
+      - config
+      - "{{ current_vmid }}"
+  register: vm_config
+  changed_when: false
+  failed_when: false
+
+- name: Parse VM config details
+  ansible.builtin.set_fact:
+    vm_name: "{{ vm_config.stdout | regex_search('(?m)^name:\\s*(.+)$', '\\1') | default('vm-' ~ (current_vmid | string), true) }}"
+    vm_ostype: "{{ vm_config.stdout | regex_search('(?m)^ostype:\\s*(.+)$', '\\1') | default('', true) }}"
+    vm_cores: "{{ (vm_config.stdout | regex_search('(?m)^cores:\\s*(\\d+)$', '\\1') | default('2', true)) | int }}"
+    vm_memory: "{{ (vm_config.stdout | regex_search('(?m)^memory:\\s*(\\d+)$', '\\1') | default('4096', true)) | int }}"
+    vm_net0: "{{ vm_config.stdout | regex_search('(?m)^net0:\\s*(.+)$', '\\1') | default('', true) }}"
+
+- name: Set per-VM runtime flags
+  ansible.builtin.set_fact:
+    vm_is_running: "{{ 'running' in ((vm_status.stdout | default('')) | lower) }}"
+    vm_is_windows: "{{ ((vm_ostype | lower) is search('win')) or ((vm_name | lower) is search('win')) }}"
+
+- name: Skip VM when not runnable Windows target
+  when: (not vm_is_running) or (not vm_is_windows)
+  ansible.builtin.set_fact:
+    vm_report_entry: >-
+      {{
+        vm_report_entry | combine({
+          'vm_name': vm_name,
+          'ostype': vm_ostype,
+          'status': 'skipped',
+          'reason': (not vm_is_running) | ternary('vm_not_running', 'not_windows_guest'),
+          'scan_finished_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')
+        }, recursive=True)
+      }}
+
+- name: Detect suspicious behavior and optionally redeploy
+  when: vm_is_running and vm_is_windows
+  block:
+    - name: Wait for QEMU guest agent ping
+      ansible.builtin.command:
+        argv:
+          - qm
+          - agent
+          - "{{ current_vmid }}"
+          - ping
+      register: qga_ping
+      retries: 24
+      delay: 5
+      until: qga_ping.rc == 0
+      changed_when: false
+
+    - name: Resolve template key by VM identity
+      ansible.builtin.set_fact:
+        template_key: >-
+          {% set n = vm_name | lower %}
+          {% set o = vm_ostype | lower %}
+          {% if 'win11' in n or '11' in o %}
+          win11
+          {% elif 'winsrv' in n or 'server' in n %}
+          winsrv
+          {% elif 'malware' in n %}
+          malware
+          {% else %}
+          win10
+          {% endif %}
+
+    - name: Resolve golden template VMID
+      ansible.builtin.set_fact:
+        golden_template_vmid: >-
+          {{
+            (
+              vmid_template_overrides[current_vmid | string]
+              if (current_vmid | string) in vmid_template_overrides
+              else (golden_template_map[template_key | trim] | default(default_windows_template_vmid))
+            ) | int
+          }}
+
+    - name: Run behavioral detector inside guest
+      environment:
+        VMID: "{{ current_vmid }}"
+        SCRIPT_NAME: "windows-behavioral-detect.ps1"
+        WCR_VMID: "{{ current_vmid }}"
+        WCR_PS: "{{ guest_ps }}"
+        WCR_STAGE: "{{ guest_stage_dir }}"
+        WCR_B64: "{{ guest_b64 }}"
+        WCR_PS1: "{{ guest_ps1 }}"
+        WCR_LOCAL_PS1: "{{ helper_dir }}/windows-behavioral-detect.ps1"
+        WCR_QM_TIMEOUT: "{{ guest_exec_timeout_seconds }}"
+        WCR_CHUNK_SIZE: "{{ guest_chunk_size }}"
+        WCR_CHUNK_WRITE_ATTEMPTS: "{{ guest_chunk_write_attempts }}"
+        SCRIPT_ARGS: >-
+          -LookbackHours {{ detection_lookback_hours }}
+          -HighCpuSeconds {{ detection_high_cpu_seconds }}
+          -HighMemoryMB {{ detection_high_memory_mb }}
+          -PowerShellBurstThreshold {{ detection_powershell_burst_threshold }}
+          {{ '-EnablePowerShellLogging' if enable_powershell_logging else '' }}
+      ansible.builtin.command: "python3 {{ helper_dir }}/guest_stage_and_remediate.py"
+      register: detection_run
+      failed_when: false
+
+    - name: Extract detector JSON payload
+      ansible.builtin.set_fact:
+        detection_json_line: >-
+          {{
+            (
+              detection_run.stdout_lines
+              | default([])
+              | select('match', '^\\{')
+              | list
+              | last
+            ) | default('{}', true)
+          }}
+
+    - name: Parse detector payload
+      ansible.builtin.set_fact:
+        detection_result: "{{ detection_json_line | from_json }}"
+        detection_score: "{{ (detection_json_line | from_json).score | default(0) | int }}"
+        detection_likely_infected: "{{ (detection_json_line | from_json).likely_infected | default(false) | bool }}"
+        should_redeploy: >-
+          {{
+            replace_infected | bool and
+            (
+              ((detection_json_line | from_json).likely_infected | default(false) | bool)
+              or
+              (((detection_json_line | from_json).score | default(0) | int) >= (detection_score_threshold | int))
+            )
+          }}
+
+    - name: Record detection result into report entry
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'vm_name': vm_name,
+              'ostype': vm_ostype,
+              'detected_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+              'template_key': template_key | trim,
+              'golden_template_vmid': golden_template_vmid,
+              'detection_result': detection_result,
+              'detection_score': detection_score,
+              'likely_infected': detection_likely_infected,
+              'redeploy_triggered': should_redeploy
+            }, recursive=True)
+          }}
+
+    - name: Stop infected VM
+      when: should_redeploy | bool
+      ansible.builtin.command:
+        argv:
+          - qm
+          - stop
+          - "{{ current_vmid }}"
+          - --skiplock
+          - "1"
+      register: stop_result
+      failed_when: false
+
+    - name: Destroy infected VM
+      when: should_redeploy | bool
+      ansible.builtin.command:
+        argv:
+          - qm
+          - destroy
+          - "{{ current_vmid }}"
+          - --purge
+          - "1"
+      register: destroy_result
+      failed_when: false
+
+    - name: Clone replacement VM from golden image with same VMID
+      when: should_redeploy | bool
+      ansible.builtin.command:
+        argv:
+          - qm
+          - clone
+          - "{{ golden_template_vmid }}"
+          - "{{ current_vmid }}"
+          - --name
+          - "{{ vm_name }}"
+          - --target
+          - "{{ proxmox_target_node }}"
+          - --full
+          - "0"
+      register: clone_result
+      delegate_to: "{{ template_node }}"
+
+    - name: Restore replacement VM compute settings
+      when: should_redeploy | bool and clone_result.rc == 0
+      ansible.builtin.command:
+        argv:
+          - qm
+          - set
+          - "{{ current_vmid }}"
+          - --cores
+          - "{{ vm_cores }}"
+          - --memory
+          - "{{ vm_memory }}"
+      register: set_compute_result
+      failed_when: false
+
+    - name: Restore replacement VM network interface
+      when: should_redeploy | bool and clone_result.rc == 0 and (vm_net0 | length > 0)
+      ansible.builtin.command:
+        argv:
+          - qm
+          - set
+          - "{{ current_vmid }}"
+          - --net0
+          - "{{ vm_net0 }}"
+      register: set_net_result
+      failed_when: false
+
+    - name: Start replacement VM
+      when: should_redeploy | bool and clone_result.rc == 0 and start_redeployed_vm | bool
+      ansible.builtin.command:
+        argv:
+          - qm
+          - start
+          - "{{ current_vmid }}"
+      register: start_result
+      failed_when: false
+
+    - name: Record redeploy timeline
+      when: should_redeploy | bool
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'destroyed_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+              'redeployed_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ'),
+              'redeploy_status': {
+                'stop_rc': (stop_result.rc | default(-1)),
+                'destroy_rc': (destroy_result.rc | default(-1)),
+                'clone_rc': (clone_result.rc | default(-1)),
+                'set_compute_rc': (set_compute_result.rc | default(-1)),
+                'set_net_rc': (set_net_result.rc | default(-1)),
+                'start_rc': (start_result.rc | default(-1))
+              }
+            }, recursive=True)
+          }}
+
+    - name: Mark final VM status
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'status': (
+                should_redeploy | bool
+              ) | ternary('redeployed', 'observed_only'),
+              'scan_finished_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')
+            }, recursive=True)
+          }}
+
+  rescue:
+    - name: Record VM processing failure
+      ansible.builtin.set_fact:
+        vm_report_entry: >-
+          {{
+            vm_report_entry | combine({
+              'vm_name': vm_name | default('unknown'),
+              'status': 'failed',
+              'error': ansible_failed_result.msg | default('unknown error'),
+              'scan_finished_at': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')
+            }, recursive=True)
+          }}
+
+- name: Append VM report entry
+  ansible.builtin.set_fact:
+    remediation_report_entries: "{{ remediation_report_entries + [vm_report_entry] }}"

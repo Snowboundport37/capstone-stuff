@@ -1,0 +1,236 @@
+###########################################################################
+# POOL CREATION
+###########################################################################
+
+- name: Check if pool exists
+  ansible.builtin.shell: |
+    pvesh get /pools/Deployment2_{{ current_user.name }} --noborder 1
+  register: pool_check
+  failed_when: false
+  changed_when: false
+  delegate_to: "{{ template_node }}"
+
+- name: Create pool if it doesn't exist
+  ansible.builtin.shell: |
+    pvesh create /pools \
+      --poolid Deployment2_{{ current_user.name }} \
+      --comment "Deployment 2 environment for {{ current_user.name }}"
+  when: pool_check.rc != 0
+  delegate_to: "{{ template_node }}"
+
+###########################################################################
+# NETWORK BRIDGE LOGIC (IDEMPOTENT)
+###########################################################################
+
+- name: Check if IP already exists anywhere on node
+  ansible.builtin.shell: |
+    ip -4 -o addr show | awk '{print $4}' | grep -qx "{{ current_user.bridge_ip }}{{ bridge_cidr }}"
+  register: ip_exists
+  failed_when: false
+  changed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Find interface that already owns the IP
+  ansible.builtin.shell: |
+    ip -4 -o addr show | awk '$4=="{{ current_user.bridge_ip }}{{ bridge_cidr }}" {print $2}'
+  register: ip_iface
+  failed_when: false
+  changed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Find next available vmbrX (only if IP unused)
+  ansible.builtin.shell: |
+    for i in $(seq 0 99); do
+      if ! ip link show vmbr$i >/dev/null 2>&1; then
+        echo vmbr$i
+        exit 0
+      fi
+    done
+    exit 1
+  args:
+    executable: /bin/bash
+  register: next_bridge
+  when: ip_exists.rc != 0
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Set bridge_name fact
+  ansible.builtin.set_fact:
+    bridge_name: >-
+      {{ (ip_iface.stdout | trim) if ip_exists.rc == 0 else (next_bridge.stdout | trim) }}
+
+- name: Show selected bridge
+  ansible.builtin.debug:
+    msg: "Using {{ bridge_name }} for {{ current_user.bridge_ip }}{{ bridge_cidr }}"
+
+- name: Create bridge config block (only if IP unused)
+  ansible.builtin.blockinfile:
+    path: /etc/network/interfaces
+    marker: "# {mark} ANSIBLE MANAGED {{ bridge_name }}"
+    block: |
+      auto {{ bridge_name }}
+      iface {{ bridge_name }} inet static
+        address {{ current_user.bridge_ip }}
+        netmask {{ bridge_netmask }}
+        bridge-ports none
+        bridge-stp off
+        bridge-fd 0
+  when: ip_exists.rc != 0
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Bring up bridge (only if created)
+  ansible.builtin.shell: |
+    ifup {{ bridge_name }}
+  when: ip_exists.rc != 0
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Verify bridge IP
+  ansible.builtin.shell: |
+    ip -4 -o addr show dev {{ bridge_name }} | awk '{print $4}' | grep -qx "{{ current_user.bridge_ip }}{{ bridge_cidr }}"
+  register: bridge_verify
+  failed_when: bridge_verify.rc != 0
+  changed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+###########################################################################
+# BUILD VM LIST WITH COUNT EXPANSION
+###########################################################################
+
+- name: Reset user_vms for this user
+  ansible.builtin.set_fact:
+    user_vms: []
+
+- name: Expand VM definitions by count
+  include_tasks: expand_vm.yaml
+  loop: "{{ current_user.vms }}"
+  loop_control:
+    loop_var: vm_def
+
+###########################################################################
+# VMID ALLOCATION
+###########################################################################
+
+- name: Get used VMIDs on target node
+  ansible.builtin.shell: |
+    qm list | awk 'NR>1 {print $1}'
+  register: used_vmids_target
+  changed_when: false
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Get used VMIDs on template node
+  ansible.builtin.shell: |
+    qm list | awk 'NR>1 {print $1}'
+  register: used_vmids_template
+  changed_when: false
+  delegate_to: "{{ template_node }}"
+
+- name: Build combined used VMID list
+  ansible.builtin.set_fact:
+    used_vmids: >-
+      {{
+        (used_vmids_target.stdout_lines + used_vmids_template.stdout_lines)
+        | map('int') | unique | list
+      }}
+
+- name: Build free VMID list in range
+  ansible.builtin.set_fact:
+    free_vmids: "{{ range(vmid_start, vmid_end + 1) | reject('in', used_vmids) | list }}"
+
+- name: Verify sufficient free VMIDs (VMs + VyOS)
+  ansible.builtin.fail:
+    msg: "Not enough free VMIDs. Need {{ user_vms | length + 1 }}, found {{ free_vmids | length }}"
+  when: free_vmids | length < user_vms | length + 1
+
+# VyOS gets free_vmids[0], regular VMs start from free_vmids[1]
+- name: Set VyOS VMID
+  ansible.builtin.set_fact:
+    vyos_vmid: "{{ free_vmids[0] }}"
+
+- name: Attach VMIDs to VM plan
+  ansible.builtin.set_fact:
+    vm_plan: "{{ vm_plan | default([]) + [ item | combine({'new_vmid': free_vmids[idx + 1]}) ] }}"
+  loop: "{{ user_vms }}"
+  loop_control:
+    index_var: idx
+
+###########################################################################
+# CLONE + CONFIG VYOS
+###########################################################################
+
+- name: Clone VyOS from template
+  ansible.builtin.shell: |
+    qm clone 3008 "{{ vyos_vmid }}" \
+      --name "VyOS-{{ current_user.name }}" \
+      --target "{{ proxmox_target_node }}" \
+      --full 0
+  delegate_to: "{{ template_node }}"
+
+- name: Remove any NICs inherited from VyOS template
+  ansible.builtin.shell: |
+    qm config {{ vyos_vmid }} | grep -oP '^net\d+' | while read nic; do
+      qm set {{ vyos_vmid }} --delete $nic
+    done
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Configure VyOS NICs and resources
+  ansible.builtin.shell: |
+    qm set "{{ vyos_vmid }}" \
+      --cores 1 \
+      --memory 1024 \
+      --net0 "virtio,bridge={{ wan_bridge }}" \
+      --net1 "virtio,bridge={{ bridge_name }}"
+  delegate_to: "{{ proxmox_target_host }}"
+
+###########################################################################
+# CLONE REGULAR VMS
+###########################################################################
+
+- name: Clone VMs (linked clone)
+  ansible.builtin.shell: |
+    qm clone "{{ item.vmid }}" "{{ item.new_vmid }}" \
+      --name "{{ item.name }}" \
+      --target "{{ proxmox_target_node }}" \
+      --full 0
+  loop: "{{ vm_plan }}"
+  delegate_to: "{{ template_node }}"
+
+- name: Apply CPU / RAM / NET options
+  ansible.builtin.shell: |
+    qm set "{{ item.new_vmid }}" \
+      --cores "{{ item.cores | int }}" \
+      --memory "{{ item.memory | int }}" \
+      --net0 "virtio,bridge={{ bridge_name }}"
+  loop: "{{ vm_plan }}"
+  delegate_to: "{{ proxmox_target_host }}"
+
+- name: Ensure TPM uses raw storage
+  ansible.builtin.shell: |
+    if qm config {{ item.new_vmid }} | grep -q '^tpmstate0:'; then
+      qm set {{ item.new_vmid }} --tpmstate0 local-lvm:1
+    fi
+  loop: "{{ vm_plan }}"
+  delegate_to: "{{ proxmox_target_host }}"
+
+###########################################################################
+# ADD ALL VMS + VYOS TO POOL
+###########################################################################
+
+- name: Add regular VMs to pool
+  ansible.builtin.shell: |
+    pvesh set /pools/Deployment2_{{ current_user.name }} --vms {{ item.new_vmid }}
+  loop: "{{ vm_plan }}"
+  delegate_to: "{{ template_node }}"
+
+- name: Add VyOS to pool
+  ansible.builtin.shell: |
+    pvesh set /pools/Deployment2_{{ current_user.name }} --vms {{ vyos_vmid }}
+  delegate_to: "{{ template_node }}"
+
+###########################################################################
+# CLEAR VARS FOR NEXT USER
+###########################################################################
+
+- name: Clear variables for next user
+  ansible.builtin.set_fact:
+    vm_plan: []
+    user_vms: []
+    vyos_vmid: ""

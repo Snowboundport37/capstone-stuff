@@ -1,0 +1,157 @@
+---
+- name: Agent Tesla Remediation
+  hosts: "{{ remediator_host | default('remediator') }}"
+  become: yes
+  gather_facts: yes
+
+  vars:
+    target_vmid: 2013
+    remediator_host: "{{ remediator_host | default('remediator') }}"
+
+    guest_ps: 'C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+    guest_stage_dir: 'C:/ProgramData/AgentTeslaRemediation'
+    guest_ps1: 'C:/ProgramData/AgentTeslaRemediation/agenttesla-remediate.ps1'
+    guest_b64: 'C:/ProgramData/AgentTeslaRemediation/stage.b64'
+    guest_run_log: 'C:\ProgramData\AgentTeslaRemediation\agenttesla-run.log'
+
+    helper_dir: '/tmp/agenttesla-remediation'
+    host_progress_log: '/tmp/agenttesla-remediation/progress.log'
+
+    guest_exec_timeout_seconds: 300
+    guest_chunk_size: 2200
+    guest_chunk_write_attempts: 8
+
+  tasks:
+    - name: Show run configuration
+      ansible.builtin.debug:
+        msg:
+          - "Target VMID={{ target_vmid }}"
+          - "Remediator host={{ remediator_host }}"
+          - "Use -vvv for detailed logs"
+
+    - name: Assert remediator host matches runtime host
+      ansible.builtin.assert:
+        that:
+          - ansible_hostname == remediator_host or inventory_hostname == remediator_host
+        fail_msg: "This play must run on remediator_host={{ remediator_host }}."
+
+    - name: Check VM status
+      ansible.builtin.command:
+        argv:
+          - qm
+          - status
+          - "{{ target_vmid }}"
+      register: qm_status
+      changed_when: false
+
+    - name: Assert VM is running
+      ansible.builtin.assert:
+        that:
+          - "'running' in (qm_status.stdout | lower)"
+        fail_msg: "VM {{ target_vmid }} is not running on {{ inventory_hostname }}."
+
+    - name: Wait for QEMU guest agent ping
+      ansible.builtin.command:
+        argv:
+          - qm
+          - agent
+          - "{{ target_vmid }}"
+          - ping
+      register: qga_ping
+      retries: 24
+      delay: 5
+      until: qga_ping.rc == 0
+      changed_when: false
+
+    - name: Run Agent Tesla remediation block
+      block:
+        - name: Reset helper working directory
+          ansible.builtin.file:
+            path: "{{ helper_dir }}"
+            state: absent
+
+        - name: Create helper working directory
+          ansible.builtin.file:
+            path: "{{ helper_dir }}"
+            state: directory
+            mode: '0700'
+
+        - name: Copy remediation assets to helper directory
+          ansible.builtin.copy:
+            src: "files/{{ item.src }}"
+            dest: "{{ helper_dir }}/{{ item.dest }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - { src: 'agenttesla-remediate.ps1', dest: 'agenttesla-remediate.ps1', mode: '0600' }
+            - { src: 'guest_stage_and_remediate.py', dest: 'guest_stage_and_remediate.py', mode: '0755' }
+
+        - name: Run remediation helper
+          environment:
+            VMID: "{{ target_vmid }}"
+            SCRIPT_NAME: "agenttesla-remediate.ps1"
+            WCR_VMID: "{{ target_vmid }}"
+            WCR_PS: "{{ guest_ps }}"
+            WCR_STAGE: "{{ guest_stage_dir }}"
+            WCR_B64: "{{ guest_b64 }}"
+            WCR_PS1: "{{ guest_ps1 }}"
+            WCR_LOCAL_PS1: "{{ helper_dir }}/agenttesla-remediate.ps1"
+            WCR_QM_TIMEOUT: "{{ guest_exec_timeout_seconds }}"
+            WCR_PROGRESS_FILE: "{{ host_progress_log }}"
+            WCR_CHUNK_SIZE: "{{ guest_chunk_size }}"
+            WCR_CHUNK_WRITE_ATTEMPTS: "{{ guest_chunk_write_attempts }}"
+          ansible.builtin.command: "python3 {{ helper_dir }}/guest_stage_and_remediate.py"
+          register: remediation_run
+          failed_when: false
+
+        - name: Read guest run log
+          ansible.builtin.command:
+            argv:
+              - qm
+              - guest
+              - exec
+              - "{{ target_vmid }}"
+              - --
+              - cmd.exe
+              - /c
+              - "type {{ guest_run_log }}"
+          register: guest_run_log_out
+          changed_when: false
+          failed_when: false
+
+        - name: Print guest run log
+          ansible.builtin.debug:
+            msg: "{{ guest_run_log_out.stdout_lines | default(['(no log captured)']) }}"
+
+        - name: Show progress log
+          ansible.builtin.command:
+            argv:
+              - cat
+              - "{{ host_progress_log }}"
+          register: helper_progress
+          changed_when: false
+          failed_when: false
+
+        - name: Print progress lines
+          ansible.builtin.debug:
+            msg: "{{ helper_progress.stdout_lines | default([]) }}"
+
+        - name: Print helper stdout
+          ansible.builtin.debug:
+            msg: "{{ remediation_run.stdout_lines | default([]) }}"
+
+        - name: Print helper stderr
+          ansible.builtin.debug:
+            msg: "{{ remediation_run.stderr_lines | default([]) }}"
+
+        - name: Assert remediation completed
+          ansible.builtin.assert:
+            that:
+              - remediation_run.rc == 0
+              - "'Cleanup finished' in (remediation_run.stdout | default(''))"
+            fail_msg: "Agent Tesla remediation did not complete cleanly. Check task output."
+
+      always:
+        - name: Clean helper working directory
+          ansible.builtin.file:
+            path: "{{ helper_dir }}"
+            state: absent
